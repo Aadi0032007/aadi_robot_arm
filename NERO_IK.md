@@ -67,6 +67,13 @@ Both presets select the native seven-joint driver and `link7` tip. Gamepad uses
 full base/tool-frame twists, with no RB requirement, and 0.04 m/s and 0.5 rad/s maximum
 Cartesian input rates at scale 1. A opens the gripper and B closes it, just as on
 SO101. The action has seven arm joints plus `gripper.pos` in 0..100% opening.
+The Nero gamepad preset reverses the left stick's X/Y translation and D-pad
+left/right roll (`invert=x,y,roll`) to match the installed arm. The right stick,
+RT/LT and D-pad up/down speed controls keep their existing mapping. SO101 retains
+its existing mapping. This applies
+to local and UDP input. To restore the original Nero base-X mapping, use
+`--teleop.invert=""`. Axis inversion affects the selected base/tool frame, so Y
+still changes the reference frame as usual.
 VR uses full controller rotation relative to
 clutch engage, including yaw; its joint follower defaults to 30 deg/s and
 120 deg/s². It interpolates both position and orientation when reducing an
