@@ -266,7 +266,8 @@ class GamepadEETeleop(_Teleoperator):
             return
         if self.config.udp_port is not None:
             from .gamepad_udp import UDPGamepadReader
-            self._reader = UDPGamepadReader(self.config.udp_port, self.config.udp_timeout_s)
+            self._reader = UDPGamepadReader(self.config.udp_port, self.config.udp_timeout_s,
+                debug=self.config.debug)
             logger.info('%s; waiting for gamepad_remote_client', self._reader.device_name)
             return
         from .gamepad import GamepadReader

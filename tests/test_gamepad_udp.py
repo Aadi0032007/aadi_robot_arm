@@ -13,7 +13,7 @@ from src.config import load
 from src.devices import apply_overrides, parse_overrides
 from src.gamepad import GamepadState, BTN_A, BTN_RT
 from src.gamepad_udp import UDPGamepadReader, decode_state, encode_state
-from src.gamepad_remote_client import run_client
+from src.gamepad_remote_client import run_client, main as client_main
 
 
 class UDPGamepadTests(unittest.TestCase):
@@ -98,6 +98,62 @@ class UDPGamepadTests(unittest.TestCase):
         self.assertNotIn('udp_port',load('so101_gamepad').teleop)
         with self.assertRaises(SystemExit):
             apply_overrides(load('nero'),{'port':'5001'})
+
+    def test_debug_boolean_on_robot_and_client_cli(self):
+        for text,expected in [('true',True),('false',False)]:
+            cfg=load('nero_gamepad')
+            apply_overrides(cfg,parse_overrides([f'--debug={text}']))
+            self.assertIs(cfg.teleop['debug'],expected)
+            with patch('sys.argv',['gamepad_remote_client',f'--debug={text}']), \
+                 patch('src.gamepad_remote_client.run_client') as run:
+                client_main()
+                self.assertIs(run.call_args.kwargs['debug'],expected)
+        with patch('sys.argv',['gamepad_remote_client','--debug']), \
+             patch('src.gamepad_remote_client.run_client') as run:
+            client_main()
+            self.assertIs(run.call_args.kwargs['debug'],True)
+
+    def test_debug_shows_exact_sent_and_received_payloads_and_timeout(self):
+        state=GamepadState(axes=[-.5,.25,0.,1.])
+        state.buttons[BTN_A]={'pressed':True,'value':1.}
+        reader=SimpleNamespace(read=lambda:state,device_name='debug test pad',close=lambda:None)
+        self.reader.debug=True
+        with patch('src.gamepad_remote_client.GamepadReader',return_value=reader), \
+             patch('src.gamepad_remote_client.time.sleep',side_effect=KeyboardInterrupt), \
+             self.assertLogs('src.gamepad_remote_client',level='INFO') as tx:
+            run_client('127.0.0.1',self.reader.address[1],debug=True)
+        self.assertTrue(select.select([self.reader._sock],[],[],.5)[0])
+        with self.assertLogs('src.gamepad_udp',level='INFO') as rx:
+            self.reader.read()
+        tx_packets=[json.loads(record.args[-1]) for record in tx.records if record.msg.startswith('GAMEPAD TX')]
+        rx_packets=[json.loads(record.args[-1]) for record in rx.records if record.msg.startswith('GAMEPAD RX from=')]
+        self.assertEqual(tx_packets,rx_packets)
+        self.assertEqual(len(tx_packets),2)  # state and exit/disconnect
+        self.assertEqual(tx_packets[0]['axes'],state.axes)
+        self.assertEqual(tx_packets[0]['buttons'],state.buttons)
+        self.assertFalse(tx_packets[1]['connected'])
+        with self.assertLogs('src.gamepad_udp',level='INFO') as logs:
+            self.send(state,seq=2,session=tx_packets[0]['session'])
+            self.send(state,seq=1,session=tx_packets[0]['session'])
+            self.reader._received_at-=1.
+            self.assertIsNone(self.reader.read())
+        self.assertTrue(any('duplicate/out-of-order' in line for line in logs.output))
+        self.assertTrue(any('timeout' in line for line in logs.output))
+
+    def test_packet_debug_is_off_by_default(self):
+        with self.assertNoLogs('src.gamepad_udp',level='INFO'):
+            self.send(GamepadState())
+        packets=[]
+        state=GamepadState()
+        reader=SimpleNamespace(read=lambda:state,device_name='fake pad',close=lambda:None)
+        sock=SimpleNamespace(sendto=lambda *args:packets.append(args),close=lambda:None)
+        with patch('src.gamepad_remote_client.GamepadReader',return_value=reader), \
+             patch('src.gamepad_remote_client.socket.socket',return_value=sock), \
+             patch('src.gamepad_remote_client.socket.gethostbyname',return_value='127.0.0.1'), \
+             patch('src.gamepad_remote_client.time.sleep',side_effect=KeyboardInterrupt), \
+             self.assertLogs('src.gamepad_remote_client',level='INFO') as logs:
+            run_client()
+        self.assertFalse(any('GAMEPAD TX' in line for line in logs.output))
 
     def test_client_reuses_reader_sends_state_and_disconnect(self):
         packets=[]

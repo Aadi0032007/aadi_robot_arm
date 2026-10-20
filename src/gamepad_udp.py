@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import socket
 import time
@@ -9,6 +10,7 @@ import time
 from .gamepad import GamepadState, NUM_AXES, NUM_BUTTONS
 
 MAX_PACKET_BYTES = 8192
+logger = logging.getLogger(__name__)
 
 
 def encode_state(state: GamepadState | None, session: str, seq: int) -> bytes:
@@ -61,12 +63,14 @@ class UDPGamepadReader:
     One active sender/session owns the input until it disconnects or times out.
     Duplicate and reordered sequence numbers do not refresh the watchdog.
     """
-    def __init__(self, port: int, timeout_s: float = .3, host: str = '0.0.0.0'):
+    def __init__(self, port: int, timeout_s: float = .3, host: str = '0.0.0.0', debug: bool = False):
         if type(port) is not int or not 0 <= port <= 65535:
             raise ValueError('UDP port must be an integer in [0, 65535]')
         if not math.isfinite(timeout_s) or timeout_s <= 0:
             raise ValueError('UDP timeout must be positive and finite')
         self.timeout_s = timeout_s
+        self.debug = debug
+        self._timeout_logged = False
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             self._sock.bind((host, port))
@@ -84,6 +88,10 @@ class UDPGamepadReader:
     def device_name(self):
         return f'UDP gamepad on {self.address[0]}:{self.address[1]}'
 
+    def _log_packet(self, address, status, data):
+        if self.debug:
+            logger.info('GAMEPAD RX from=%s:%s status=%s payload=%r', *address, status, data)
+
     def read(self) -> GamepadState | None:
         if self._sock is None:
             return None
@@ -99,19 +107,27 @@ class UDPGamepadReader:
                 raise
             try:
                 session, seq, state = decode_state(data)
-            except (ValueError, OverflowError):
+            except (ValueError, OverflowError) as e:
+                self._log_packet(address, f'rejected: {e}', data)
                 continue
             now = time.monotonic()
             peer = (address, session)
             live = self._state is not None and self._received_at is not None and now-self._received_at <= self.timeout_s
             if self._peer == peer:
                 if seq <= self._last_seq:
+                    self._log_packet(address, 'ignored: duplicate/out-of-order', data)
                     continue
             elif live:
+                self._log_packet(address, 'ignored: another sender is active', data)
                 continue
             self._peer, self._last_seq = peer, seq
             self._state, self._received_at = state, now
+            self._timeout_logged = False
+            self._log_packet(address, 'accepted', data)
         if self._received_at is None or time.monotonic()-self._received_at > self.timeout_s:
+            if self.debug and self._received_at is not None and not self._timeout_logged:
+                logger.info('GAMEPAD RX timeout: no fresh packet for %.3f s; input unavailable', self.timeout_s)
+                self._timeout_logged = True
             return None
         return self._state.copy() if self._state is not None else None
 

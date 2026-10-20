@@ -45,6 +45,7 @@ Configuration arguments use the same names as the lerobot CLI (lerobot-teleopera
   --teleop.type=so101_leader --teleop.port=COM5 --teleop.id=aadi_so101_leader
   --teleop.type=keyboard_joints --teleop.speed=30
   --teleop.type=gamepad_ee --port=5001   UDP gamepad on 0.0.0.0; omit --port for local USB
+  --debug=true   Print received UDP gamepad packets and active mapped inputs (default: false)
   --teleop.type=hand_ee --teleop.camera_index=0 --teleop.invert=y,yaw
   --teleop.type=vr_ee --teleop.port=8443 --teleop.hand=right --teleop.position_scale=1.0
   --fps=30 --display_data=true --display_mode=rerun --play_sounds=false
@@ -62,6 +63,7 @@ int/float/bool/none/JSON when they look like one, else kept as text."""
 # Repo-style names → where they live in ArmConfig.
 ALIASES = {
     "port": "teleop.udp_port",
+    "debug": "teleop.debug",
     "dataset.single_task": "task",
     "single_task": "task",
     "dataset.fps": "fps",
@@ -204,6 +206,8 @@ def apply_overrides(cfg: ArmConfig, overrides: dict[str, str]) -> ArmConfig:
         parts = key.split(".")
         head = parts[0]
         val = coerce(raw)
+        if key == 'teleop.debug':
+            val = str2bool(raw)
 
         if head in ("robot", "teleop"):
             if len(parts) != 2:

@@ -27,7 +27,7 @@ from .gamepad_udp import encode_state
 logger = logging.getLogger(__name__)
 
 
-def run_client(ip='127.0.0.1', port=5001, fps=60.):
+def run_client(ip='127.0.0.1', port=5001, fps=60., debug=False):
     if type(port) is not int or not 1 <= port <= 65535:
         raise ValueError('Port must be an integer in [1, 65535]')
     if not math.isfinite(fps) or not 1 <= fps <= 240:
@@ -37,6 +37,15 @@ def run_client(ip='127.0.0.1', port=5001, fps=60.):
     reader = None
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     session, seq, connected = uuid.uuid4().hex, 0, None
+
+    def send(state):
+        nonlocal seq
+        packet = encode_state(state, session, seq)
+        sock.sendto(packet, target)
+        if debug:
+            logger.info('GAMEPAD TX to=%s:%s payload=%s', *target, packet.decode('utf-8'))
+        seq += 1
+
     try:
         reader = GamepadReader()
         logger.info('Gamepad -> %s:%s at %g Hz (Ctrl-C to stop)', *target, fps)
@@ -49,14 +58,13 @@ def run_client(ip='127.0.0.1', port=5001, fps=60.):
                             *([reader.device_name] if present else []))
                 connected = present
             # Send idle states too: this heartbeat distinguishes rest from dropout.
-            sock.sendto(encode_state(state, session, seq), target)
-            seq += 1
+            send(state)
             time.sleep(max(0., 1./fps-(time.perf_counter()-started)))
     except KeyboardInterrupt:
         pass
     finally:
         try:
-            sock.sendto(encode_state(None, session, seq), target)
+            send(None)
         except OSError:
             pass
         sock.close()
@@ -64,15 +72,26 @@ def run_client(ip='127.0.0.1', port=5001, fps=60.):
             reader.close()
 
 
+def debug_bool(value):
+    text = str(value).lower()
+    if text in ('true', '1', 'yes', 'on'):
+        return True
+    if text in ('false', '0', 'no', 'off'):
+        return False
+    raise argparse.ArgumentTypeError('debug must be true or false')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--ip', default='127.0.0.1', help='Robot computer IP (default: 127.0.0.1)')
     parser.add_argument('--port', type=int, default=5001, help='Robot UDP port (default: 5001)')
     parser.add_argument('--fps', '--hz', type=float, default=60., help='State/heartbeat rate (default: 60 Hz)')
+    parser.add_argument('--debug', nargs='?', const=True, default=False, type=debug_bool,
+                        help='Print every transmitted packet, including axes/buttons (default: false)')
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format='%(levelname)s %(message)s')
     try:
-        run_client(args.ip, args.port, args.fps)
+        run_client(args.ip, args.port, args.fps, debug=args.debug)
     except (ValueError, OSError, ImportError) as e:
         parser.exit(1, f'{e}\n')
 

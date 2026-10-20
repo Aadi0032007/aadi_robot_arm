@@ -43,6 +43,25 @@ settings remain on the receiver. The receiver also supports
 for gamepad input, separate from robot serial/CAN settings and remote leader ports.
 The same override works in `src.record`.
 
+To compare exactly what is sent and received, enable packet debug on both computers:
+
+```powershell
+# Robot computer (Nero example; --debug also works with the SO101 command)
+python -m src.teleop --preset nero_gamepad --robot.channel=can1 --port=5001 --debug=true
+# Gamepad computer
+python -m src.gamepad_remote_client --ip=ROBOT_IP --port=5001 --debug=true
+```
+
+Both default to `--debug=false`. A bare `--debug` also enables it. The robot
+accepts `--teleop.debug=true` as well. `GAMEPAD TX` lines show the destination and
+the full JSON packet; `GAMEPAD RX` lines show the sender, accepted/rejected/ignored
+status and packet contents. Compare `session` and `seq` across the two terminals.
+The payload includes connection state, all four axes and all seventeen button/
+trigger values. The receiver reports timeouts and duplicate/out-of-order frames.
+The robot's existing debug output also shows active inputs after mapping. Packet
+debug prints every packet, so use it temporarily when diagnosing input/network
+behavior; console output can slow the control loop.
+
 SO101 arm-mode translation now prefers the current tilt/roll but relaxes this
 orientation hold when it blocks Cartesian progress. This helps reach positions
 that need the wrist to change angle, as it naturally does during leader control.
