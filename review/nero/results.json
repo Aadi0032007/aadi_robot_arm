@@ -1,0 +1,56 @@
+{
+  "joints": [
+    "joint1",
+    "joint2",
+    "joint3",
+    "joint4",
+    "joint5",
+    "joint6",
+    "joint7"
+  ],
+  "tip": "flange_link",
+  "limits_deg": [
+    [
+      -154.99998048556108,
+      154.99998048556108
+    ],
+    [
+      -99.69465635276325,
+      99.69465635276325
+    ],
+    [
+      -157.56339366097637,
+      157.56339366097637
+    ],
+    [
+      -57.86873730821315,
+      122.61296815799618
+    ],
+    [
+      -157.56339366097637,
+      157.56339366097637
+    ],
+    [
+      -41.8259190445501,
+      54.4309905374282
+    ],
+    [
+      -89.99999846476551,
+      89.99999846476551
+    ]
+  ],
+  "jacobian_error_linear": 3.052229701025693e-07,
+  "jacobian_error_angular": 3.006589682681548e-10,
+  "sdk_fk_worst_position_mm": 38.900563729987645,
+  "sdk_fk_worst_orientation_deg": 120.00025218550947,
+  "sdk_link7_worst_position_mm": 5.708903225196451e-05,
+  "sdk_link7_worst_orientation_deg": 1.0254874634068721e-05,
+  "round_trip_success": 200,
+  "round_trip_trials": 200,
+  "median_position_error_mm": 0.01994969514280615,
+  "median_orientation_error_deg": 0.0005070989512158008,
+  "median_solve_ms": 2.478599999449216,
+  "trajectory_failures": 0,
+  "trajectory_steps": 239,
+  "max_trajectory_joint_step_deg": 1.937041887408363
+}
