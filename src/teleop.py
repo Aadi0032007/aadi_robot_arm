@@ -53,6 +53,7 @@ from .cameras import CamerasManager, RobotWithCameras
 from .config import ArmConfig
 from .devices import add_bool_flag, describe, load_config, make_parser, make_robot, make_teleop
 from .recorder import SessionWriter, latest_run_dir, new_run_dir, next_session_dir
+from .nero_robot import NeroTrackingError
 
 logger = logging.getLogger(__name__)
 
@@ -268,11 +269,15 @@ def teleop_and_record(
             obs = robot.get_observation()
             if getattr(teleop, "needs_seed", False):
                 teleop.seed_from_observation(obs)
+            if hasattr(teleop, 'update_observation'):
+                teleop.update_observation(obs)
 
             # leader
             leader_action: dict[str, float] | None = None
             if not ai_active or ai.read_leader_while_ai:
-                leader_action = teleop_action_processor((teleop.get_action(), obs))
+                raw_action = teleop.get_action()
+                if getattr(teleop, 'command_ready', True):
+                    leader_action = teleop_action_processor((raw_action, obs))
             # buttons on the input device itself (VR controller: X = Space, Y = Left) act like the keys
             if hasattr(teleop, "pop_events"):
                 for name in teleop.pop_events():
@@ -304,7 +309,17 @@ def teleop_and_record(
                         ai_waiting_logged = False
 
             if action_values is not None:
-                robot.send_action(robot_action_processor((action_values, obs)))
+                try:
+                    robot.send_action(robot_action_processor((action_values, obs)))
+                except NeroTrackingError as e:
+                    if source != 'human' or not hasattr(teleop, 'on_target_rejected'):
+                        raise
+                    # The driver rejected this target before sending anything.
+                    # Re-anchor and require neutral controls, rather than retrying
+                    # the rejected target or dropping out of the teleop session.
+                    teleop.on_target_rejected(e.measured_action)
+                    action_values = None
+                    logging.warning('%s; gamepad paused. Release motion controls and A/B to resume.', e)
 
             obs_processed = None
             if session is not None or display_data:

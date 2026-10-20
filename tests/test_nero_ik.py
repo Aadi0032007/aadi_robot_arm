@@ -17,7 +17,7 @@ from src.config import load
 from src.devices import make_robot
 from src.kinematics import IKResult, matrix_to_rotvec, rotvec_to_matrix
 from src.nero_ik import nero_kinematics, plan_cartesian, reachable
-from src.nero_robot import NeroJointRobot, NeroRobotConfig, NERO_JOINTS
+from src.nero_robot import NeroJointRobot, NeroRobotConfig, NeroTrackingError, NERO_JOINTS
 
 
 class NeroIKTests(unittest.TestCase):
@@ -104,6 +104,15 @@ class NeroIKTests(unittest.TestCase):
             robot.send_action({'joint1.pos':.1})
         self.assertFalse(self.sent)
 
+    def test_tracking_fault_identifies_joint_and_sends_nothing(self):
+        robot=self.native()
+        robot.config.max_relative_target=5.
+        with self.assertRaises(NeroTrackingError) as caught:
+            robot.send_action({'joint3.pos':7.})
+        self.assertIn('joint3 target 7.00 deg, measured 0.00 deg',str(caught.exception))
+        self.assertEqual(caught.exception.measured_action['joint3.pos'],0.)
+        self.assertEqual(self.sent,[])
+
     def test_gripper_width_is_not_degrees(self):
         robot = self.native(with_gripper=True)
         commands = []
@@ -163,6 +172,121 @@ class TeleopIntegrationTests(unittest.TestCase):
         p=teleop.kin.fk(q)[:3,3]
         teleop._step_frame(np.array([.001,0,0]),np.zeros(3))
         self.assertLess(np.linalg.norm(teleop.kin.fk(teleop._q)[:3,3]-p-[.001,0,0]),.0005)
+
+    def nero_gamepad_control(self):
+        from src.gamepad_teleop import GamepadEETeleop,GamepadEETeleopConfig
+        spec=dict(load('nero_gamepad').teleop)
+        spec.pop('type')
+        return GamepadEETeleop(GamepadEETeleopConfig(**spec))
+
+    def test_no_udp_input_does_not_enable_commands_and_reanchors_drift(self):
+        from src.gamepad import GamepadState
+        control=self.nero_gamepad_control()
+        obs={k:0. for k in control.kin.keys}
+        obs['gripper.pos']=40.
+        control.seed_from_observation(obs)
+        control._reader=SimpleNamespace(read=lambda:None)
+        control.get_action()
+        self.assertFalse(control.command_ready)
+        # Arm settles while waiting; old seed would now violate the 5-degree guard.
+        obs['joint2.pos']=12.
+        obs['gripper.pos']=45.
+        control.update_observation(obs)
+        control.get_action()
+        self.assertFalse(control.command_ready)
+        self.assertAlmostEqual(np.degrees(control._q[1]),12.)
+        control._reader=SimpleNamespace(read=lambda:GamepadState())
+        first=control.get_action()
+        self.assertTrue(control.command_ready)
+        self.assertAlmostEqual(first['joint2.pos'],12.)
+        self.assertAlmostEqual(first['gripper.pos'],45.)
+
+    def test_tracking_error_pauses_until_neutral_and_then_resumes(self):
+        from src.gamepad import GamepadState,BTN_A
+        control=self.nero_gamepad_control()
+        q=np.array([0.,20.,0.,60.,0.,10.,0.])
+        obs=dict(zip(control.kin.keys,q))
+        obs['gripper.pos']=40.
+        control.seed_from_observation(obs)
+        control._input_available=True
+        control._q[0]+=np.radians(7.)
+        control.update_observation(obs)
+        held=GamepadState(axes=[0.,-.5,0.,0.])
+        held.buttons[BTN_A]={'pressed':True,'value':1.}
+        control._reader=SimpleNamespace(read=lambda:held)
+        paused=control.get_action()
+        self.assertFalse(control.command_ready)
+        np.testing.assert_allclose([paused[k] for k in control.kin.keys],q)
+        self.assertEqual(paused['gripper.pos'],40.)
+        control._reader=SimpleNamespace(read=lambda:GamepadState())
+        control.get_action()
+        self.assertTrue(control.command_ready)
+        control._reader=SimpleNamespace(read=lambda:held)
+        control._last_t=99.95
+        with patch('src.gamepad_teleop.time.perf_counter',return_value=100.):
+            resumed=control.get_action()
+        self.assertGreater(resumed['gripper.pos'],40.)
+        self.assertGreater(np.max(np.abs(control._q-np.radians(q))),1e-6)
+
+    def test_driver_rejection_between_reads_reanchors_and_latches_pause(self):
+        from src.gamepad import GamepadState
+        control=self.nero_gamepad_control()
+        initial={k:0. for k in control.kin.keys}
+        initial['gripper.pos']=40.
+        control.seed_from_observation(initial)
+        control._input_available=True
+        newer=dict(initial)
+        newer['joint1.pos']=8.
+        control.on_target_rejected(newer)
+        self.assertFalse(control.command_ready)
+        self.assertAlmostEqual(np.degrees(control._q[0]),8.)
+        control._reader=SimpleNamespace(read=lambda:GamepadState())
+        resumed=control.get_action()
+        self.assertTrue(control.command_ready)
+        self.assertAlmostEqual(resumed['joint1.pos'],8.)
+
+    def test_so101_translation_relaxes_orientation_when_it_blocks_reach(self):
+        from src.gamepad_teleop import GamepadEETeleop,GamepadEETeleopConfig
+        seed=np.radians([99.01688,-34.45797,-78.73527,-61.57115,-151.31603])
+        dp=np.array([-.0000594,.0007911,.0018359])
+        errors={}
+        for mode in ('hold','adaptive','free'):
+            teleop=GamepadEETeleop(GamepadEETeleopConfig(translation_orientation=mode))
+            teleop._q=seed.copy()
+            target=teleop.kin.fk(seed)[:3,3]+dp
+            teleop._step_arm(dp,0.,0.,0.)
+            errors[mode]=np.linalg.norm(teleop.kin.fk(teleop._q)[:3,3]-target)
+            self.assertTrue(np.all(teleop._q>=teleop.kin.chain.lower+teleop.kin.limit_margin-1e-10))
+            self.assertTrue(np.all(teleop._q<=teleop.kin.chain.upper-teleop.kin.limit_margin+1e-10))
+            self.assertLessEqual(np.max(np.abs(teleop._q-seed)),np.radians(5)+1e-10)
+        self.assertGreater(errors['hold'],.0005)
+        self.assertLess(errors['adaptive'],.0001)
+        self.assertLess(errors['free'],.0001)
+
+    def test_so101_easy_translation_preserves_original_orientation_solution(self):
+        from src.gamepad_teleop import GamepadEETeleop,GamepadEETeleopConfig
+        outputs=[]
+        seed=np.radians([0,20,-30,10,0])
+        for mode in ('hold','adaptive'):
+            teleop=GamepadEETeleop(GamepadEETeleopConfig(translation_orientation=mode))
+            teleop._q=seed.copy()
+            teleop._step_arm(np.array([.001,0,0]),0.,0.,0.)
+            outputs.append(teleop._q)
+        np.testing.assert_allclose(*outputs,atol=1e-12)
+
+    def test_so101_deliberate_rotation_is_not_relaxed(self):
+        from src.gamepad_teleop import GamepadEETeleop,GamepadEETeleopConfig
+        teleop=GamepadEETeleop(GamepadEETeleopConfig())
+        teleop._q=np.radians([99.01688,-34.45797,-78.73527,-61.57115,-151.31603])
+        with patch.object(teleop.kin,'solve',wraps=teleop.kin.solve) as solve:
+            teleop._step_arm(np.array([-.0000594,.0007911,.0018359]),0.,.005,0.)
+        self.assertEqual(solve.call_count,1)
+        self.assertEqual(solve.call_args.kwargs['orientation_weight'],1.)
+
+    def test_so101_floor_stays_enabled(self):
+        from src.gamepad_teleop import GamepadEETeleop,GamepadEETeleopConfig
+        teleop=GamepadEETeleop(GamepadEETeleopConfig())
+        np.testing.assert_allclose(teleop._floor(np.array([.2,0,.02]),np.array([.201,0,.019])),[.201,0,.02])
 
     def test_nero_sticks_and_ab_without_rb_send_seven_joints_and_gripper(self):
         from src.gamepad import GamepadState, BTN_A, BTN_B, BTN_RB

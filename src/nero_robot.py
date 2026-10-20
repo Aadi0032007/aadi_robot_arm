@@ -16,6 +16,17 @@ NERO_JOINTS = [f'joint{i}' for i in range(1, 8)]
 NERO_URDF = ARM_ROOT / 'urdf' / 'nero' / 'nero_with_gripper.urdf'
 
 
+class NeroTrackingError(ValueError):
+    """A valid target is too far from feedback; no motion command was sent."""
+    def __init__(self, measured_action, target_deg, limit):
+        self.measured_action = dict(measured_action)
+        measured = np.array([measured_action[f'{n}.pos'] for n in NERO_JOINTS])
+        errors = np.abs(target_deg-measured)
+        i = int(np.argmax(errors))
+        super().__init__(f'Nero tracking limit: {NERO_JOINTS[i]} target {target_deg[i]:.2f} deg, '
+            f'measured {measured[i]:.2f} deg, difference {errors[i]:.2f} deg > {limit:.2f} deg')
+
+
 @dataclass
 class NeroRobotConfig:
     id: str = 'revobots_nero'
@@ -175,7 +186,7 @@ class NeroJointRobot:
         if c.max_relative_target is not None:
             measured = np.array([obs[f'{n}.pos'] for n in NERO_JOINTS])
             if np.any(np.abs(q-measured) > c.max_relative_target):
-                raise ValueError('Nero target exceeds max_relative_target from measured joints')
+                raise NeroTrackingError(obs, q, c.max_relative_target)
         gripper = action.get('gripper.pos')
         maximum = .1 if c.gripper_mode == 'width' else 100.
         if gripper is not None and (not math.isfinite(float(gripper)) or not 0 <= float(gripper) <= maximum):

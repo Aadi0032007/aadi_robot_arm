@@ -89,6 +89,7 @@ _Teleoperator, _TeleoperatorConfig = _lerobot_base()
 class GamepadEETeleopConfig(_TeleoperatorConfig):
     udp_port: int | None = None  # None = local USB; otherwise listen on 0.0.0.0
     udp_timeout_s: float = 0.3  # missing remote frames: hold, including the gripper
+    max_tracking_error_deg: float | None = None  # pause/re-anchor when measured joints lag commands
     # ── kinematics (defaults = SO-101 follower) ──────────────────────────────
     urdf_path: str = str(SO101_URDF)
     tip_link: str = SO101_TIP_LINK
@@ -121,9 +122,12 @@ class GamepadEETeleopConfig(_TeleoperatorConfig):
     #        roll  = rotate about the gripper's own axis (roll_joint axis), tool point held;
     #        yaw   = swing the whole arm about yaw_joint: a 5-DOF arm cannot turn the gripper
     #                sideways without moving it, so "face left/right" moves the tool on an arc;
-    #        orientation hold only tracks pitch + roll, the unreachable axis is not fought.
+    #        orientation hold tracks pitch + roll; adaptive translation may relax it.
     # "frame": full 3-axis rotations about the base / tool frame axes (6+ DOF arms).
     orientation_mode: str = "arm"
+    # Arm-mode translation: prefer the current tilt/roll, but allow the wrist
+    # to change when that hold obstructs a reachable Cartesian position.
+    translation_orientation: str = 'adaptive'  # adaptive | hold | free
     # arm mode: pitch / roll move ONLY pitch_joint / roll_joint (the gripper swings about the
     # wrist, nothing else moves). False = IK keeps the tool point still and moves the other
     # joints to do it.
@@ -154,6 +158,8 @@ class GamepadEETeleop(_Teleoperator):
         self.config = config
         if config.udp_port is not None and (type(config.udp_port) is not int or not 1 <= config.udp_port <= 65535):
             raise ValueError('teleop.udp_port must be an integer in [1, 65535]')
+        if config.max_tracking_error_deg is not None and (not math.isfinite(config.max_tracking_error_deg) or config.max_tracking_error_deg <= 0):
+            raise ValueError('max_tracking_error_deg must be positive and finite or None')
         self.kin = ArmKinematics(
             ArmKinematicsConfig(
                 urdf_path=config.urdf_path,
@@ -176,6 +182,8 @@ class GamepadEETeleop(_Teleoperator):
             raise ValueError("teleop.speed_levels must not be empty")
         if config.orientation_mode not in ("arm", "frame"):
             raise ValueError("teleop.orientation_mode must be 'arm' or 'frame'")
+        if config.translation_orientation not in ('adaptive', 'hold', 'free'):
+            raise ValueError('teleop.translation_orientation must be adaptive, hold or free')
         if config.orientation_mode == "arm":
             for label, joint in (("pitch", config.pitch_joint), ("roll", config.roll_joint), ("yaw", config.yaw_joint)):
                 if joint not in self.kin.motors:
@@ -193,6 +201,8 @@ class GamepadEETeleop(_Teleoperator):
         self._frame = config.frame
         self._prev_pressed: set[int] = set()
         self._engaged = False
+        self._input_available = False
+        self._tracking_paused = False
         self._last_t: float | None = None
         self._warned_at: dict[str, float] = {}
 
@@ -288,6 +298,30 @@ class GamepadEETeleop(_Teleoperator):
         self.needs_seed = False
         logger.info("Tool pose at start: %s", format_pose(self.kin.fk(self._q)))
 
+    @property
+    def command_ready(self) -> bool:
+        """The enclosing loop must not transmit stale targets during dropout/pause."""
+        return self._input_available and not self._tracking_paused
+
+    def update_observation(self, observation: dict[str, Any]) -> None:
+        """Called each control tick before input integration, using live feedback."""
+        measured = self.kin.motor_to_q(observation)
+        limit = self.config.max_tracking_error_deg
+        if (self._q is not None and self._input_available and limit is not None
+                and np.max(np.abs(np.degrees(self._q-measured))) > limit):
+            if not self._tracking_paused:
+                logger.warning('Gamepad tracking error exceeds %.1f deg; release sticks, triggers, D-pad rotation and A/B to resume.', limit)
+            self._tracking_paused = True
+        if self._q is None or not self._input_available or self._tracking_paused:
+            self._q = measured.copy()
+            if self.config.gripper_key:
+                self._gripper = float(observation[self.config.gripper_key])
+
+    def on_target_rejected(self, observation: dict[str, Any]) -> None:
+        """Handle a tracking fault detected by the driver between loop reads."""
+        self._tracking_paused = True
+        self.update_observation(observation)
+
     # ── action ───────────────────────────────────────────────────────────────
 
     def get_action(self) -> dict[str, float]:
@@ -300,12 +334,24 @@ class GamepadEETeleop(_Teleoperator):
 
         state = self._reader.read() if self._reader is not None else None
         if state is None:
-            self._warn("nopad", "No gamepad attached; holding position.")
+            self._input_available = False
+            message = 'Waiting for fresh UDP gamepad input; no commands sent.' if c.udp_port is not None else 'No gamepad attached; no commands sent.'
+            self._warn("nopad", message)
             self._set_engaged(False)
             self._prev_pressed = set()
             return self._action()
 
+        self._input_available = True
+
         pressed = {i for i in range(NUM_BUTTONS) if state.pressed(i)}
+        if self._tracking_paused:
+            v, w = self._twist(state, pressed)
+            if not np.any(v) and not np.any(w) and not pressed.intersection((BTN_A, BTN_B)):
+                self._tracking_paused = False
+                logger.info('Gamepad re-armed from measured joints; controls are neutral.')
+            self._prev_pressed = pressed
+            self._set_engaged(False)
+            return self._action()
         edges = pressed - self._prev_pressed
         self._prev_pressed = pressed
         self._handle_toggles(edges)
@@ -411,17 +457,34 @@ class GamepadEETeleop(_Teleoperator):
             self._warn("floor", f"tool at the z_min_m floor ({c.z_min_m * 100:.1f} cm); not moving lower.")
         return p_t
 
-    def _solve(self, p_t: np.ndarray, R_t: np.ndarray, q_seed: np.ndarray, orientation_axes=None) -> np.ndarray | None:
+    def _solve(self, p_t: np.ndarray, R_t: np.ndarray, q_seed: np.ndarray, orientation_axes=None,
+               translation_only: bool = False) -> np.ndarray | None:
         """IK for one jog step; None (with a warning) when the position cannot be reached."""
         c = self.config
         target = np.eye(4)
         target[:3, :3] = R_t
         target[:3, 3] = p_t
+        weight = c.orientation_weight
+        if translation_only and c.translation_orientation == 'free':
+            weight = 0.
         res = self.kin.solve(
-            target, q_seed, orientation_weight=c.orientation_weight, max_iters=c.ik_iters,
+            target, q_seed, orientation_weight=weight, max_iters=c.ik_iters,
             orientation_axes=orientation_axes,
         )
-        rot_bad = (c.max_rot_error_deg is not None and c.orientation_weight > 0
+        if translation_only and c.translation_orientation == 'adaptive' and weight > 0:
+            requested_step = float(np.linalg.norm(p_t - self.kin.fk(q_seed)[:3, 3]))
+            # The 3 mm acceptance tolerance alone can hide a stalled 1-2 mm jog.
+            # Retry when orientation holding consumes a significant part of the
+            # requested displacement, even if the original solve was accepted.
+            if res.pos_err > max(1e-4, .2 * requested_step):
+                relaxed = self.kin.solve(target, q_seed, orientation_weight=0.,
+                    max_iters=c.ik_iters, orientation_axes=orientation_axes)
+                if (np.all(np.isfinite(relaxed.q)) and math.isfinite(relaxed.pos_err)
+                        and relaxed.pos_err < res.pos_err - 1e-6):
+                    res, weight = relaxed, 0.
+                    if c.debug:
+                        self._debug('Translation: relaxing wrist orientation to preserve Cartesian progress')
+        rot_bad = (c.max_rot_error_deg is not None and weight > 0
                    and res.rot_err > math.radians(c.max_rot_error_deg))
         if not np.all(np.isfinite(res.q)) or res.pos_err > c.max_pos_error_m or rot_bad:
             self._warn(
@@ -491,6 +554,9 @@ class GamepadEETeleop(_Teleoperator):
         c = self.config
         chain = self.kin.chain
         q = self._q.copy()
+        # A deliberate rotation request keeps its orientation target. Adaptive
+        # relaxation applies only when the operator asks for translation alone.
+        translation_only = np.any(dp) and not (droll or dpitch or dyaw)
 
         # Yaw = swing the whole arm about the pan joint (exact, no IK needed).
         if dyaw:
@@ -511,7 +577,8 @@ class GamepadEETeleop(_Teleoperator):
             droll = dpitch = 0.0
 
         # Translation (and, with wrist_direct=False, pitch/roll about the tool point) through IK.
-        # The orientation task holds only tilt + roll, so the wrist keeps the gripper's angle while moving.
+        # Prefer tilt + roll while moving; adaptive translation can release that
+        # preference when it obstructs position. Explicit rotations keep their target.
         if np.any(dp) or droll or dpitch:
             T, origins, axes = chain.frames(q)
             p, R = T[:3, 3].copy(), T[:3, :3]
@@ -520,7 +587,8 @@ class GamepadEETeleop(_Teleoperator):
                 dp = dp[0] * approach + dp[1] * left + dp[2] * np.cross(approach, left)
             p_t = self._floor(p, p + dp)
             R_t = rotvec_to_matrix(droll * approach - dpitch * left) @ R
-            q_ik = self._solve(p_t, R_t, q, orientation_axes=(self._i_pitch, self._i_roll))
+            q_ik = self._solve(p_t, R_t, q, orientation_axes=(self._i_pitch, self._i_roll),
+                translation_only=bool(translation_only))
             if q_ik is not None:
                 q = q_ik
 

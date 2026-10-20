@@ -310,7 +310,8 @@ def nero_gamepad() -> ArmConfig:
     # Auto gripper mode exposes 0..100% in whichever SDK mode is reported.
     cfg.robot.update(with_gripper=True, gripper_mode='auto')
     cfg.teleop.update(require_deadman=False, gripper_needs_deadman=False,
-        gripper_key='gripper.pos', gripper_min=0., gripper_max=100., gripper_speed=60.)
+        gripper_key='gripper.pos', gripper_min=0., gripper_max=100., gripper_speed=60.,
+        max_tracking_error_deg=5.)
     return cfg
 
 

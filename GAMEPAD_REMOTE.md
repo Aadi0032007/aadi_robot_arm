@@ -43,9 +43,21 @@ settings remain on the receiver. The receiver also supports
 for gamepad input, separate from robot serial/CAN settings and remote leader ports.
 The same override works in `src.record`.
 
+SO101 arm-mode translation now prefers the current tilt/roll but relaxes this
+orientation hold when it blocks Cartesian progress. This helps reach positions
+that need the wrist to change angle, as it naturally does during leader control.
+Use `--teleop.translation_orientation=hold` for the previous behavior or `free`
+for position-only translation. Explicit rotation inputs still retain their targets.
+The model joint limits, 1-degree margin and 2 cm tool-height floor remain in force.
+Nero full-frame orientation control is unchanged.
+
 The client streams unchanged idle states as heartbeats. Unplugging the gamepad
 or exiting sends a disconnected packet. Missing updates for 0.3 seconds return
-no input, so both arm and gripper commands hold. Malformed input and duplicate
+no input. In `src.teleop`, no gamepad commands are transmitted during that wait;
+the integrated target is re-anchored to measured joints before input resumes.
+Nero's 5-degree tracking guard pauses gamepad control instead of terminating
+teleop. Release sticks, triggers, D-pad rotation and A/B to re-arm from the
+measured pose. Malformed input and duplicate
 or reordered packets do not refresh the watchdog. The reader drains queued
 packets to use the newest state; one active sender/session owns control until
 it disconnects or times out. Sending resumes after client/gamepad reconnect.

@@ -90,6 +90,17 @@ Koch leader offsets and does not zero redundant joints. Feedback is checked for
 missing/nonfinite values and frozen timestamps. The driver rejects out-of-limit
 targets and targets over 5 degrees from the measured state by default.
 
+In `src.teleop`, the gamepad receives current joint feedback every tick. While
+local/UDP input is missing it re-anchors its starting target to those measurements
+and the loop sends no gamepad commands. If a live command differs from measured
+joints by more than 5 degrees, gamepad control pauses and re-anchors. Release
+sticks, triggers, D-pad rotation and A/B to re-arm, then move again. The driver
+also checks immediately before transmission; a tracking rejection there is caught
+for human gamepad control and pauses the session without sending the rejected
+target. Its diagnostic identifies the joint, target, measurement and difference.
+Other validation/feedback failures still stop the loop. The standalone move CLI
+continues to abort on tracking faults.
+
 The existing `nero` leader preset is retained. Native seven-joint recordings use
 a separate dataset/schema; a five-joint leader policy is not directly compatible.
 Disconnecting the native driver leaves torque enabled by default, avoiding an

@@ -603,6 +603,7 @@ Useful `--teleop.*` settings (all in `GamepadEETeleopConfig`, `src/gamepad_teleo
 | `pitch_joint` / `roll_joint` / `yaw_joint` | `wrist_flex` / `wrist_roll` / `shoulder_pan` | joints that define the arm-mode axes |
 | `z_min_m` | 0.02 | tool cannot be driven below this height; `none` disables |
 | `orientation_weight` | 1.0 | 0 = position only, orientation left free |
+| `translation_orientation` | `adaptive` | arm mode: prefer current tilt/roll, retry position-only if holding orientation blocks translation; `hold` restores the previous behavior, `free` always allows orientation changes during translation-only input |
 | `max_pos_error_m` | 0.003 | steps the IK cannot reach within this are rejected (arm holds) |
 | `max_joint_step_deg` | 5 | per tick |
 | `deadzone` / `expo` | 0.12 / 1.5 | stick shaping |
