@@ -20,14 +20,13 @@ Mapping (W3C / Xbox layout, see gamepad.py):
     Left stick L/R       Y  left / right
     Right stick up/down  Z  up / down
     Right stick L/R      Yaw: swing the arm left / right (shoulder_pan)
-    RT / LT              Pitch: tilt the gripper up / down (wrist_flex only)
+    D-pad up/down        Pitch: tilt the gripper up / down (wrist_flex only)
     D-pad L/R            Roll: rotate the gripper (wrist_roll only)
-    D-pad up/down        Speed up / down (steps through speed_levels)
-    A / B                Gripper open / close
+    RB / LB              Gripper open / close
     X                    Precision mode on/off (x precision_scale)
     Y                    Toggle base / tool reference frame
-    RB                   Deadman only if --teleop.require_deadman=true (off by default)
-    LB, Start            Reserved (ignored)
+    LT                   Deadman only if --teleop.require_deadman=true (off by default)
+    A, B, RT, Start      Reserved (ignored); speed is configured with command arguments
 
 Each tick: target = FK(last command) + twist * dt, in the base or the tool frame, then
 IK seeded from the last command. Because the target is re-based on the last command
@@ -55,12 +54,11 @@ from .gamepad import (
     AXIS_LEFT_Y,
     AXIS_RIGHT_X,
     AXIS_RIGHT_Y,
-    BTN_A,
-    BTN_B,
     BTN_DPAD_DOWN,
     BTN_DPAD_LEFT,
     BTN_DPAD_RIGHT,
     BTN_DPAD_UP,
+    BTN_LB,
     BTN_LT,
     BTN_RB,
     BTN_RT,
@@ -228,20 +226,18 @@ class GamepadEETeleop(_Teleoperator):
         c = self.config
         lin = c.max_linear_speed * self.speed_scale * 100
         ang = math.degrees(c.max_angular_speed * self.speed_scale)
-        deadman = "  HOLD RB      deadman: no motion without it\n" if c.require_deadman else ""
+        deadman = "  HOLD LT      deadman: no motion without it\n" if c.require_deadman else ""
         return (
             f"Gamepad Cartesian jog  (frame={self._frame}, speed x{self.speed_scale:.2f} = {lin:.1f} cm/s, {ang:.0f} deg/s)\n"
             f"{deadman}"
             "  left stick   up/down = X forward/back   left/right = Y left/right\n"
             + (
                 "  right stick  up/down = Z up/down        left/right = swing arm left/right\n"
-                "  RT / LT      tilt gripper up / down\n"
                 if c.orientation_mode == "arm"
                 else "  right stick  up/down = Z up/down        left/right = yaw\n"
-                "  RT / LT      pitch\n"
             )
-            + "  D-pad        left/right = roll          up/down = speed +/-\n"
-            "  A / B        gripper open / close\n"
+            + "  D-pad        left/right = roll          up/down = pitch up/down\n"
+            "  RB / LB      gripper open / close\n"
             "  X            precision mode on/off      Y = base/tool frame"
         )
 
@@ -311,7 +307,7 @@ class GamepadEETeleop(_Teleoperator):
         if (self._q is not None and self._input_available and limit is not None
                 and np.max(np.abs(np.degrees(self._q-measured))) > limit):
             if not self._tracking_paused:
-                logger.warning('Gamepad tracking error exceeds %.1f deg; release sticks, triggers, D-pad rotation and A/B to resume.', limit)
+                logger.warning('Gamepad tracking error exceeds %.1f deg; release sticks, D-pad and RB/LB to resume.', limit)
             self._tracking_paused = True
         if self._q is None or not self._input_available or self._tracking_paused:
             self._q = measured.copy()
@@ -347,7 +343,7 @@ class GamepadEETeleop(_Teleoperator):
         pressed = {i for i in range(NUM_BUTTONS) if state.pressed(i)}
         if self._tracking_paused:
             v, w = self._twist(state, pressed)
-            if not np.any(v) and not np.any(w) and not pressed.intersection((BTN_A, BTN_B)):
+            if not np.any(v) and not np.any(w) and not pressed.intersection((BTN_RB, BTN_LB)):
                 self._tracking_paused = False
                 logger.info('Gamepad re-armed from measured joints; controls are neutral.')
             self._prev_pressed = pressed
@@ -357,11 +353,11 @@ class GamepadEETeleop(_Teleoperator):
         self._prev_pressed = pressed
         self._handle_toggles(edges)
 
-        deadman = (BTN_RB in pressed) or not c.require_deadman
+        deadman = (BTN_LT in pressed) or not c.require_deadman
         self._set_engaged(deadman)
 
         if c.gripper_key and self._gripper is not None and (deadman or not c.gripper_needs_deadman):
-            direction = (1.0 if BTN_A in pressed else 0.0) - (1.0 if BTN_B in pressed else 0.0)
+            direction = (1.0 if BTN_RB in pressed else 0.0) - (1.0 if BTN_LB in pressed else 0.0)
             if direction:
                 self._gripper = float(np.clip(self._gripper + direction * c.gripper_speed * dt, c.gripper_min, c.gripper_max))
 
@@ -395,17 +391,10 @@ class GamepadEETeleop(_Teleoperator):
         if engaged != self._engaged:
             self._engaged = engaged
             if self.config.require_deadman:
-                logger.info("motion %s", "ENABLED (RB held)" if engaged else "disabled (hold RB to move)")
+                logger.info("motion %s", "ENABLED (LT held)" if engaged else "disabled (hold LT to move)")
 
     def _handle_toggles(self, edges: set[int]) -> None:
-        c = self.config
         changed = False
-        if BTN_DPAD_UP in edges and self._speed_idx < len(c.speed_levels) - 1:
-            self._speed_idx += 1
-            changed = True
-        if BTN_DPAD_DOWN in edges and self._speed_idx > 0:
-            self._speed_idx -= 1
-            changed = True
         if BTN_X in edges:
             self._precision = not self._precision
             changed = True
@@ -415,8 +404,8 @@ class GamepadEETeleop(_Teleoperator):
         if changed:
             logger.info(
                 "frame=%s  speed x%.2f (%.1f cm/s, %.0f deg/s)%s",
-                self._frame, self.speed_scale, c.max_linear_speed * self.speed_scale * 100,
-                math.degrees(c.max_angular_speed * self.speed_scale), "  PRECISION" if self._precision else "",
+                self._frame, self.speed_scale, self.config.max_linear_speed * self.speed_scale * 100,
+                math.degrees(self.config.max_angular_speed * self.speed_scale), "  PRECISION" if self._precision else "",
             )
 
     def _shape(self, value: float, deadzone: float) -> float:
@@ -432,15 +421,14 @@ class GamepadEETeleop(_Teleoperator):
         ly = self._shape(state.axis(AXIS_LEFT_Y), c.deadzone)
         rx = self._shape(state.axis(AXIS_RIGHT_X), c.deadzone)
         ry = self._shape(state.axis(AXIS_RIGHT_Y), c.deadzone)
-        rt = self._shape(state.value(BTN_RT), c.trigger_deadzone)
-        lt = self._shape(state.value(BTN_LT), c.trigger_deadzone)
         roll = (1.0 if BTN_DPAD_RIGHT in pressed else 0.0) - (1.0 if BTN_DPAD_LEFT in pressed else 0.0)
+        pitch = (1.0 if BTN_DPAD_UP in pressed else 0.0) - (1.0 if BTN_DPAD_DOWN in pressed else 0.0)
         # Stick axes are W3C: up and left are negative.
         #   left stick  -> X (up = forward), Y (left = +Y)
         #   right stick -> Z (up = up),       yaw (left = counter-clockwise from above)
-        #   RT / LT     -> pitch (RT = tilt gripper up)
+        #   D-pad U/D   -> pitch (up = tilt gripper up)
         v = np.array([-ly * s["x"], -lx * s["y"], -ry * s["z"]])
-        w = np.array([roll * s["roll"], (rt - lt) * s["pitch"], -rx * s["yaw"]])
+        w = np.array([roll * s["roll"], pitch * s["pitch"], -rx * s["yaw"]])
         return v, w
 
     def _step(self, dp: np.ndarray, dtheta: np.ndarray) -> None:

@@ -179,6 +179,77 @@ class TeleopIntegrationTests(unittest.TestCase):
         spec.pop('type')
         return GamepadEETeleop(GamepadEETeleopConfig(**spec))
 
+    def test_dpad_pitch_moves_both_robots_in_opposite_directions_without_changing_speed(self):
+        from src.gamepad import GamepadState, BTN_DPAD_UP, BTN_DPAD_DOWN
+        from src.gamepad_teleop import GamepadEETeleop, GamepadEETeleopConfig
+        for preset, angles in [('so101_gamepad', [0,20,-30,10,0]),
+                               ('nero_gamepad', [0,20,0,60,0,10,0])]:
+            with self.subTest(robot=preset):
+                deltas=[]
+                for button in (BTN_DPAD_UP, BTN_DPAD_DOWN):
+                    spec=dict(load(preset).teleop)
+                    spec.pop('type')
+                    control=GamepadEETeleop(GamepadEETeleopConfig(**spec))
+                    obs=dict(zip(control.kin.keys, angles))
+                    obs['gripper.pos']=40.
+                    control.seed_from_observation(obs)
+                    state=GamepadState()
+                    state.buttons[button]={'pressed':True,'value':1.}
+                    control._reader=SimpleNamespace(read=lambda:state)
+                    speed=control.speed_scale
+                    control._last_t=99.98
+                    with patch('src.gamepad_teleop.time.perf_counter',return_value=100.):
+                        action=control.get_action()
+                    self.assertEqual(control.speed_scale,speed)
+                    self.assertEqual(action['gripper.pos'],40.)
+                    deltas.append(control._q-np.radians(angles))
+                    self.assertGreater(np.linalg.norm(deltas[-1]),1e-5)
+                self.assertLess(float(np.dot(*deltas)),0.)
+
+    def test_old_pitch_and_gripper_buttons_do_not_move_robot(self):
+        from src.gamepad import GamepadState, BTN_A, BTN_B, BTN_RT, BTN_LT
+        control=self.nero_gamepad_control()
+        obs=dict(zip(control.kin.keys,[0,20,0,60,0,10,0]))
+        obs['gripper.pos']=40.
+        control.seed_from_observation(obs)
+        for button in (BTN_A, BTN_B, BTN_RT, BTN_LT):
+            with self.subTest(button=button):
+                state=GamepadState()
+                state.buttons[button]={'pressed':True,'value':1.}
+                control._reader=SimpleNamespace(read=lambda:state)
+                control._last_t=99.95
+                with patch('src.gamepad_teleop.time.perf_counter',return_value=100.):
+                    action=control.get_action()
+                np.testing.assert_allclose([action[k] for k in control.kin.keys],
+                                           [obs[k] for k in control.kin.keys],atol=1e-12)
+                self.assertEqual(action['gripper.pos'],40.)
+
+    def test_optional_deadman_uses_lt_without_opening_gripper(self):
+        from src.gamepad import GamepadState, BTN_RB, BTN_LT
+        control=self.nero_gamepad_control()
+        control.config.require_deadman=True
+        control.config.gripper_needs_deadman=True
+        obs=dict(zip(control.kin.keys,[0,20,0,60,0,10,0]))
+        obs['gripper.pos']=40.
+        control.seed_from_observation(obs)
+        state=GamepadState(axes=[0.,-.5,0.,0.])
+        state.buttons[BTN_RB]={'pressed':True,'value':1.}
+        control._reader=SimpleNamespace(read=lambda:state)
+        def tick():
+            control._last_t=99.95
+            with patch('src.gamepad_teleop.time.perf_counter',return_value=100.):
+                return control.get_action()
+        held=tick()
+        self.assertEqual(held['gripper.pos'],40.)
+        np.testing.assert_allclose(control._q,np.radians([0,20,0,60,0,10,0]))
+        state.buttons[BTN_RB]={'pressed':False,'value':0.}
+        state.buttons[BTN_LT]={'pressed':True,'value':1.}
+        enabled=tick()
+        self.assertGreater(np.linalg.norm(control._q-np.radians([0,20,0,60,0,10,0])),1e-6)
+        self.assertEqual(enabled['gripper.pos'],40.)
+        state.buttons[BTN_RB]={'pressed':True,'value':1.}
+        self.assertGreater(tick()['gripper.pos'],40.)
+
     def test_no_udp_input_does_not_enable_commands_and_reanchors_drift(self):
         from src.gamepad import GamepadState
         control=self.nero_gamepad_control()
@@ -202,7 +273,7 @@ class TeleopIntegrationTests(unittest.TestCase):
         self.assertAlmostEqual(first['gripper.pos'],45.)
 
     def test_tracking_error_pauses_until_neutral_and_then_resumes(self):
-        from src.gamepad import GamepadState,BTN_A
+        from src.gamepad import GamepadState,BTN_RB
         control=self.nero_gamepad_control()
         q=np.array([0.,20.,0.,60.,0.,10.,0.])
         obs=dict(zip(control.kin.keys,q))
@@ -212,7 +283,7 @@ class TeleopIntegrationTests(unittest.TestCase):
         control._q[0]+=np.radians(7.)
         control.update_observation(obs)
         held=GamepadState(axes=[0.,-.5,0.,0.])
-        held.buttons[BTN_A]={'pressed':True,'value':1.}
+        held.buttons[BTN_RB]={'pressed':True,'value':1.}
         control._reader=SimpleNamespace(read=lambda:held)
         paused=control.get_action()
         self.assertFalse(control.command_ready)
@@ -288,8 +359,8 @@ class TeleopIntegrationTests(unittest.TestCase):
         teleop=GamepadEETeleop(GamepadEETeleopConfig())
         np.testing.assert_allclose(teleop._floor(np.array([.2,0,.02]),np.array([.201,0,.019])),[.201,0,.02])
 
-    def test_nero_sticks_and_ab_without_rb_send_seven_joints_and_gripper(self):
-        from src.gamepad import GamepadState, BTN_A, BTN_B, BTN_RB
+    def test_nero_sticks_and_bumpers_send_seven_joints_and_gripper_without_deadman(self):
+        from src.gamepad import GamepadState, BTN_RB, BTN_LB, BTN_LT
         from src.gamepad_teleop import GamepadEETeleop,GamepadEETeleopConfig
         for mode in ('width','angle'):
             with self.subTest(feedback_mode=mode):
@@ -316,9 +387,9 @@ class TeleopIntegrationTests(unittest.TestCase):
                 teleop.seed_from_observation(robot.get_observation())
                 self.assertAlmostEqual(teleop._gripper,40.)
                 state=GamepadState()
-                state.axes[1]=-.5  # translation plus gripper input, without RB
-                state.buttons[BTN_A]={'pressed':True,'value':1.}
-                self.assertFalse(state.pressed(BTN_RB))
+                state.axes[1]=-.5  # translation plus gripper input, without LT
+                state.buttons[BTN_RB]={'pressed':True,'value':1.}
+                self.assertFalse(state.pressed(BTN_LT))
                 teleop._reader=SimpleNamespace(read=lambda:state)
                 teleop._last_t=99.95
                 with patch('src.gamepad_teleop.time.perf_counter',return_value=100.):
@@ -331,8 +402,8 @@ class TeleopIntegrationTests(unittest.TestCase):
                 self.assertEqual(gripper_targets[-1][0],mode)
                 scale=1000. if mode=='width' else 1.
                 self.assertAlmostEqual(gripper_targets[-1][1],opened['gripper.pos']/scale)
-                state.buttons[BTN_A]={'pressed':False,'value':0.}
-                state.buttons[BTN_B]={'pressed':True,'value':1.}
+                state.buttons[BTN_RB]={'pressed':False,'value':0.}
+                state.buttons[BTN_LB]={'pressed':True,'value':1.}
                 teleop._last_t=99.95
                 with patch('src.gamepad_teleop.time.perf_counter',return_value=100.):
                     closed=teleop.get_action()
@@ -363,7 +434,7 @@ class TeleopIntegrationTests(unittest.TestCase):
         import select
         import socket
         from dataclasses import replace
-        from src.gamepad import GamepadState,BTN_A,BTN_X,BTN_RT
+        from src.gamepad import GamepadState,BTN_RB,BTN_X,BTN_DPAD_UP
         from src.gamepad_teleop import GamepadEETeleop,GamepadEETeleopConfig
         from src.gamepad_udp import UDPGamepadReader,encode_state
         for preset,q_deg in [('so101_gamepad',[0,20,-30,10,0]),('nero_gamepad',[0,20,0,60,0,10,0])]:
@@ -376,9 +447,9 @@ class TeleopIntegrationTests(unittest.TestCase):
                 remote=GamepadEETeleop(replace(cfg,udp_port=reader.address[1]))
                 sender=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
                 state=GamepadState(axes=[.2,-.3,.1,-.1])
-                state.buttons[BTN_A]={'pressed':True,'value':1.}
+                state.buttons[BTN_RB]={'pressed':True,'value':1.}
                 state.buttons[BTN_X]={'pressed':True,'value':1.}
-                state.buttons[BTN_RT]={'pressed':False,'value':.2}
+                state.buttons[BTN_DPAD_UP]={'pressed':True,'value':1.}
                 fake_local=SimpleNamespace(read=lambda:state,device_name='local test pad',close=lambda:None)
                 try:
                     # Each branch opens only the selected input backend.
@@ -403,7 +474,7 @@ class TeleopIntegrationTests(unittest.TestCase):
                     reader._received_at-=1.
                     with patch('src.gamepad_teleop.time.perf_counter',return_value=100.05):
                         held=remote.get_action()
-                    self.assertEqual(held,actual)  # no continued stick/A movement after dropout
+                    self.assertEqual(held,actual)  # no continued stick/bumper movement after dropout
                 finally:
                     sender.close()
                     local.disconnect()

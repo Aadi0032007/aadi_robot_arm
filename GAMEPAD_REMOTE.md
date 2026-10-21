@@ -10,6 +10,9 @@ Nero, on the robot computer:
 python -m src.teleop --preset nero_gamepad --port=5001
 ```
 
+The `nero_gamepad` preset inverts X, Y, Z and roll by default; no
+`--teleop.invert` argument is needed. An explicit argument overrides this default.
+
 SO101, on the robot computer:
 
 ```powershell
@@ -36,8 +39,12 @@ LeRobot or robot SDK is needed by the client. Configure IK and robot hardware on
 the receiving computer as usual. The client is the same for every robot using
 `gamepad_ee`, including custom URDF/motor mappings.
 
-Local controls and UDP controls share stick/trigger/button processing, speed
-toggles, reference-frame toggles and A/B gripper open/close. All robot-specific
+Local controls and UDP controls share stick/button processing, precision and
+reference-frame toggles, and RB/LB gripper open/close. D-pad up/down controls
+pitch; D-pad left/right controls roll. Set speed with `--teleop.initial_speed_level`,
+`--teleop.max_linear_speed` and `--teleop.max_angular_speed`; X toggles precision.
+A/B and RT are unused. LT is the optional deadman when `--teleop.require_deadman=true`
+(disabled by default). All robot-specific
 settings remain on the receiver. The receiver also supports
 `--teleop.udp_port=5001` and `--teleop.udp_timeout_s=0.3`. `--port` is a shortcut
 for gamepad input, separate from robot serial/CAN settings and remote leader ports.
@@ -75,7 +82,7 @@ or exiting sends a disconnected packet. Missing updates for 0.3 seconds return
 no input. In `src.teleop`, no gamepad commands are transmitted during that wait;
 the integrated target is re-anchored to measured joints before input resumes.
 Nero's 5-degree tracking guard pauses gamepad control instead of terminating
-teleop. Release sticks, triggers, D-pad rotation and A/B to re-arm from the
+teleop. Release sticks, D-pad and RB/LB to re-arm from the
 measured pose. Malformed input and duplicate
 or reordered packets do not refresh the watchdog. The reader drains queued
 packets to use the newest state; one active sender/session owns control until
@@ -94,3 +101,4 @@ and omit axes/buttons. Sequence numbers increase throughout a client session.
 
 Tests use loopback sockets and fake controllers; they never access robot CAN
 or servos. Networked use between two physical computers remains to be tested.
+

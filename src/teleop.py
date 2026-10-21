@@ -319,7 +319,7 @@ def teleop_and_record(
                     # the rejected target or dropping out of the teleop session.
                     teleop.on_target_rejected(e.measured_action)
                     action_values = None
-                    logging.warning('%s; gamepad paused. Release motion controls and A/B to resume.', e)
+                    logging.warning('%s; gamepad paused. Release motion controls and RB/LB to resume.', e)
 
             obs_processed = None
             if session is not None or display_data:
