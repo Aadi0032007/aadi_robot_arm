@@ -13,17 +13,22 @@ Memory lives in /dev/shm, which is a tmpfs (pure RAM). A 640x480x3 BGR
 frame is ~900 KB; a memcpy at that size is ~1 ms on a Jetson — about
 3% of one 30 fps frame budget. Publishing is effectively free.
 
-Layout (one shared-memory region per camera):
+Two payload types, selected by ``dtype_code``:
+    0   uint8   BGR colour frames   (H, W, 3)   region ``lab_<camera>``
+    1   uint16  depth maps in mm    (H, W, 1)   region ``lab_<camera>_depth`` (RealSense)
+A reader learns the dtype from the header, so one ``FrameBusReader(name)`` works for both.
+
+Layout (one shared-memory region per stream):
     offset      size        field        notes
     0           8           magic        b"LABFBUS" + layout version byte
     8           4           n_slots      uint32
-    12          4           dtype_code   uint32 — 0 = uint8 (BGR)
+    12          4           dtype_code   uint32 — 0 = uint8, 1 = uint16
     16          12          shape        3 x uint32: height, width, channels
     28          4           reserved
     32          8           pub_count    uint64 — frames published so far
     40          24          padding      align the slot table to 64 bytes
     64          n*64        slot table   per slot: float64 ts, uint64 frame_idx
-    64+n*64     n*h*w*c     payloads     n contiguous BGR frames
+    64+n*64     n*h*w*c*s   payloads     n contiguous frames, s = dtype itemsize
 
 Concurrency:
     A ring of n slots, not a seqlock. The writer fills the slot that the
@@ -49,10 +54,20 @@ Usage (writer, inside teleop):
     pub.publish(frame_bgr, timestamp)
     pub.close()        # closes the region; unlinks /dev/shm/lab_wrist
 
+    depth_pub = FrameBusPublisher("eye_depth", height=480, width=640, channels=1, dtype=np.uint16)
+    depth_pub.publish(depth_mm, timestamp)
+
 Usage (reader, in any other process):
     rdr = FrameBusReader("wrist")
     ts, frame = rdr.read_latest()       # (None, None) if no frame yet
+    rdr.dtype                           # np.uint8 or np.uint16, known after the first attach
     rdr.close()
+
+Usage (reader that bridges dropped / skipped frames: inference, RTSP stream):
+    rdr = HoldLastReader("wrist", max_repeats=30)
+    ts, frame = rdr.read()              # newest frame, or the previous one again when none
+                                        # arrived (30 times in a row at most), then
+                                        # FrameBusStalled names the camera and the region
 
 The layout version in the magic is checked on attach. Bumping it means
 teleop and every reader must be restarted together; a mismatch raises
@@ -62,7 +77,7 @@ rather than misparsing someone else's bytes as pixels.
 from __future__ import annotations
 
 from multiprocessing import shared_memory
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 
@@ -93,15 +108,20 @@ _OFF_SLOT_IDX = 8      # uint64
 # copy. 3 is the minimum the validation bound allows; 4 costs 900 KB more.
 DEFAULT_N_SLOTS = 4
 
+# dtype_code <-> numpy dtype. Adding a code is layout-compatible: an older reader
+# raises on an unknown code instead of misreading the bytes.
+_DTYPE_BY_CODE = {0: np.dtype(np.uint8), 1: np.dtype(np.uint16)}
+_CODE_BY_DTYPE = {dt: code for code, dt in _DTYPE_BY_CODE.items()}
+
 
 def _region_name(camera_name: str) -> str:
     return f"{_SHM_PREFIX}{camera_name}"
 
 
-def _region_size(n_slots: int, height: int, width: int, channels: int) -> int:
+def _region_size(n_slots: int, height: int, width: int, channels: int, itemsize: int = 1) -> int:
     return (_HEADER_SIZE
             + n_slots * _SLOT_DESC_SIZE
-            + n_slots * height * width * channels)
+            + n_slots * height * width * channels * itemsize)
 
 
 def _untrack(shm) -> None:
@@ -138,19 +158,23 @@ class FrameBusPublisher:
         width: int,
         channels: int = 3,
         n_slots: int = DEFAULT_N_SLOTS,
+        dtype: Any = np.uint8,
     ) -> None:
         self._name     = _region_name(camera_name)
         self._height   = int(height)
         self._width    = int(width)
         self._channels = int(channels)
         self._n_slots  = int(n_slots)
+        self._dtype    = np.dtype(dtype)
 
         if self._n_slots < 3:
             # The reader's validity bound is (pub_count advanced <= n-2), so
             # n=2 would leave zero tolerance and n=1 would be unreadable.
             raise ValueError(f"n_slots must be >= 3, got {self._n_slots}")
+        if self._dtype not in _CODE_BY_DTYPE:
+            raise ValueError(f"dtype must be one of {sorted(str(d) for d in _CODE_BY_DTYPE)}, got {self._dtype}")
 
-        size = _region_size(self._n_slots, self._height, self._width, self._channels)
+        size = _region_size(self._n_slots, self._height, self._width, self._channels, self._dtype.itemsize)
 
         # Clean up any stale region left behind by a previous crashed teleop.
         try:
@@ -184,7 +208,7 @@ class FrameBusPublisher:
         # Payload ring — n contiguous frames.
         self._payload = np.ndarray(
             (self._n_slots, self._height, self._width, self._channels),
-            dtype=np.uint8,
+            dtype=self._dtype,
             buffer=buf,
             offset=_HEADER_SIZE + self._n_slots * _SLOT_DESC_SIZE,
         )
@@ -196,7 +220,7 @@ class FrameBusPublisher:
         self._slot_ts[:]    = 0.0
         self._slot_idx[:]   = 0
         self._n_slots_v[0]  = self._n_slots
-        self._dtype_v[0]    = 0          # 0 = uint8
+        self._dtype_v[0]    = _CODE_BY_DTYPE[self._dtype]
         self._shape_v[0]    = self._height
         self._shape_v[1]    = self._width
         self._shape_v[2]    = self._channels
@@ -217,6 +241,10 @@ class FrameBusPublisher:
     def n_slots(self) -> int:
         return self._n_slots
 
+    @property
+    def dtype(self) -> np.dtype:
+        return self._dtype
+
     def publish(self, frame: np.ndarray, timestamp: float) -> None:
         """Publish a frame. Caller must pass an array with the configured shape & dtype."""
         if self._closed:
@@ -226,8 +254,8 @@ class FrameBusPublisher:
                 f"frame shape {frame.shape} != region shape "
                 f"({self._height}, {self._width}, {self._channels})"
             )
-        if frame.dtype != np.uint8:
-            raise ValueError(f"frame dtype {frame.dtype} != uint8")
+        if frame.dtype != self._dtype:
+            raise ValueError(f"frame dtype {frame.dtype} != {self._dtype}")
 
         # Fill the next slot. Readers are looking at slot (pub_count-1) % n,
         # which is not this one, so nothing below is observable until the
@@ -317,6 +345,7 @@ class FrameBusReader:
         self._payload   = None
         self._n_slots   = 0
         self._shape: Optional[tuple] = None
+        self._dtype: Optional[np.dtype] = None
         self._last_count = 0
 
         # Try to attach now; if teleop hasn't started yet, read_latest()
@@ -361,14 +390,15 @@ class FrameBusReader:
         if n < 3 or h <= 0 or w <= 0 or c <= 0:
             _close_quietly(shm)
             return False
-        if hdr["dtype"] != 0:
+        dtype = _DTYPE_BY_CODE.get(hdr["dtype"])
+        if dtype is None:
             _close_quietly(shm)
             raise RuntimeError(
                 f"frame bus {self._name!r} has dtype_code {hdr['dtype']}, "
-                f"expected 0 (uint8)."
+                f"this build knows {sorted(_DTYPE_BY_CODE)} (0 = uint8 colour, 1 = uint16 depth)."
             )
 
-        need = _region_size(n, h, w, c)
+        need = _region_size(n, h, w, c, dtype.itemsize)
         if hdr["size"] < need:
             _close_quietly(shm)
             raise RuntimeError(
@@ -387,12 +417,13 @@ class FrameBusReader:
             offset=_HEADER_SIZE + _OFF_SLOT_IDX, strides=(_SLOT_DESC_SIZE,),
         )
         self._payload = np.ndarray(
-            (n, h, w, c), dtype=np.uint8, buffer=buf,
+            (n, h, w, c), dtype=dtype, buffer=buf,
             offset=_HEADER_SIZE + n * _SLOT_DESC_SIZE,
         )
 
         self._n_slots = n
         self._shape = (h, w, c)
+        self._dtype = dtype
         self._shm = shm
         return True
 
@@ -405,6 +436,11 @@ class FrameBusReader:
     @property
     def n_slots(self) -> int:
         return self._n_slots
+
+    @property
+    def dtype(self) -> Optional[np.dtype]:
+        """Payload dtype (uint8 colour / uint16 depth); None until attached."""
+        return self._dtype
 
     @property
     def last_frame_idx(self) -> int:
@@ -458,7 +494,71 @@ class FrameBusReader:
         self._payload   = None
         self._n_slots   = 0
         self._shape     = None
+        self._dtype     = None
         if self._shm is not None:
             _close_quietly(self._shm)
             self._shm = None
         # Reader never calls unlink — only the writer owns the region's lifetime.
+
+
+# ── Hold-last reader ─────────────────────────────────────────────────────────
+
+# Reads in a row that may reuse the previous frame: one second at 30 fps.
+DEFAULT_MAX_REPEATS = 30
+
+
+class FrameBusStalled(RuntimeError):
+    """A frame bus delivered no new frame for more than ``max_repeats`` reads in a row."""
+
+
+class HoldLastReader:
+    """``FrameBusReader`` that bridges dropped or skipped frames with the last good one.
+
+    ``read()`` returns the newest frame when the writer published one since the
+    previous call. When it did not (the camera skipped a frame, the copy was lapped,
+    or teleop stopped publishing), the previous frame is returned again, at most
+    ``max_repeats`` times in a row; a fresh frame resets the count. The read after
+    that raises ``FrameBusStalled`` naming the camera and the region, and so does
+    every later read until a fresh frame arrives.
+
+    Before the first frame ``read()`` returns (None, None) without counting: waiting
+    for teleop to start is the caller's timeout, not a dropped frame.
+    """
+
+    def __init__(self, camera_name: str, max_repeats: int = DEFAULT_MAX_REPEATS) -> None:
+        if int(max_repeats) < 0:
+            raise ValueError(f"max_repeats must be >= 0, got {max_repeats}")
+        self.camera_name = camera_name
+        self.max_repeats = int(max_repeats)
+        self.repeats = 0                     # previous frame reused this many times in a row
+        self._reader = FrameBusReader(camera_name)
+        self._last: tuple[Optional[float], Optional[np.ndarray]] = (None, None)
+
+    @property
+    def region(self) -> str:
+        return _region_name(self.camera_name)
+
+    @property
+    def reader(self) -> FrameBusReader:
+        return self._reader
+
+    def read(self) -> tuple[Optional[float], Optional[np.ndarray]]:
+        ts, frame = self._reader.read_new()
+        if frame is not None:
+            self._last = (ts, frame)
+            self.repeats = 0
+            return ts, frame
+        if self._last[1] is None:
+            return None, None
+        if self.repeats >= self.max_repeats:
+            raise FrameBusStalled(
+                f"camera {self.camera_name!r}: frame bus {self.region} delivered no new frame "
+                f"for {self.max_repeats} reads in a row (last frame reused {self.max_repeats} times). "
+                f"Is the camera still connected and teleop still running?"
+            )
+        self.repeats += 1
+        return self._last
+
+    def close(self) -> None:
+        self._reader.close()
+        self._last = (None, None)

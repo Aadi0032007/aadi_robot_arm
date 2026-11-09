@@ -50,20 +50,19 @@ If preflight reports a speed/acceleration violation, increase move_time_s.
 An unreachable pose fails without sending targets. Motion uses SDK move_j;
 controller tracking errors can still make the physical path differ from the plan.
 
-## Gamepad and VR
+## Gamepad
 
 Run with the existing LeRobot environment and pyAgxArm installed:
 
 ```powershell
 python -m src.teleop --preset nero_gamepad
-python -m src.teleop --preset nero_vr
 ```
 
 For a gamepad on another computer, add `--port=5001` to the Nero gamepad command
 and run `python -m src.gamepad_remote_client --ip=ROBOT_IP --port=5001` there.
 Omit `--port` for local USB. See [GAMEPAD_REMOTE.md](GAMEPAD_REMOTE.md).
 
-Both presets select the native seven-joint driver and `link7` tip. Gamepad uses
+The preset selects the native seven-joint driver and `link7` tip. Gamepad uses
 full base/tool-frame twists, with no RB requirement, and 0.04 m/s and 0.5 rad/s maximum
 Cartesian input rates at scale 1. A opens the gripper and B closes it, just as on
 SO101. The action has seven arm joints plus `gripper.pos` in 0..100% opening.
@@ -73,13 +72,10 @@ RT/LT and D-pad up/down speed controls keep their existing mapping. SO101 retain
 its existing mapping. This applies
 to local and UDP input. To restore the original Nero base-X mapping, use
 `--teleop.invert=""`. Axis inversion affects the selected base/tool frame, so Y
-still changes the reference frame as usual.
-VR uses full controller rotation relative to
-clutch engage, including yaw; its joint follower defaults to 30 deg/s and
-120 deg/s². It interpolates both position and orientation when reducing an
-unreachable target. SO101 remains in its existing arm orientation mode.
+still changes the reference frame as usual. SO101 remains in its existing arm
+orientation mode.
 
-To use the nominal gripper reference in either preset:
+To use the nominal gripper reference:
 
 ```powershell
 python -m src.teleop --preset nero_gamepad --teleop.tip_link=gripper_tcp
@@ -120,10 +116,10 @@ this value at 60 units/s. Startup seeds the command from measured opening withou
 switching gripper modes or moving to a preset opening. Width and motor angle are
 not mechanically converted into each other.
 
-Gripper commands remain off in the standalone Cartesian and VR presets, preserving
-opening during their arm moves. Optional explicit `gripper_mode=width` uses metres;
+Gripper commands remain off in the standalone `nero_cartesian` preset, preserving
+opening during its arm moves. Optional explicit `gripper_mode=width` uses metres;
 `gripper_mode=angle` uses degrees, and each must match reported feedback. If enabling
-width control in VR use `gripper_max=0.1`. Keep these units consistent.
+width control use `gripper_max=0.1`. Keep these units consistent.
 
 ## Verification
 

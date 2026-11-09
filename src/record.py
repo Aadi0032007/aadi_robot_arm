@@ -76,7 +76,7 @@ def record(cfg: ArmConfig, run_dir: Path) -> list[Path]:
     try:
         robot.connect()
         teleop.connect()
-        if getattr(teleop, "needs_seed", False):  # keyboard jog starts from the arm's current pose
+        if getattr(teleop, "needs_seed", False):  # gamepad jog starts from the arm's current pose
             teleop.seed_from_observation(robot.get_observation())
         listener, events = init_keyboard_listener()
 

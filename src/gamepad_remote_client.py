@@ -3,16 +3,20 @@
     python -m src.gamepad_remote_client --ip=192.168.1.20 --port=5001
     python src/gamepad_remote_client.py --ip=127.0.0.1 --port=5001
 
+Default transport is Porter/RevoPilot protocol v2 (named axes/buttons).
+Pass --protocol=v1 for the original gamepad_state packets.
+
 Uses the same GamepadReader/SDL mapping as local control. Requires pygame only;
 LeRobot, robot SDKs and IK are needed only on the robot computer.
 """
 from __future__ import annotations
 
-if __package__ in (None, ''):
+if __package__ in (None, ""):
     import sys
     from pathlib import Path
+
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    __package__ = 'src'
+    __package__ = "src"
 
 import argparse
 import logging
@@ -22,16 +26,19 @@ import time
 import uuid
 
 from .gamepad import GamepadReader
-from .gamepad_udp import encode_state
+from .gamepad_udp import encode_state, encode_v2_state
 
 logger = logging.getLogger(__name__)
 
 
-def run_client(ip='127.0.0.1', port=5001, fps=60., debug=False):
+def run_client(ip="127.0.0.1", port=5001, fps=60.0, debug=False, protocol="v2"):
     if type(port) is not int or not 1 <= port <= 65535:
-        raise ValueError('Port must be an integer in [1, 65535]')
+        raise ValueError("Port must be an integer in [1, 65535]")
     if not math.isfinite(fps) or not 1 <= fps <= 240:
-        raise ValueError('FPS must be in [1, 240]')
+        raise ValueError("FPS must be in [1, 240]")
+    protocol = str(protocol).lower()
+    if protocol not in ("v1", "v2"):
+        raise ValueError("protocol must be v1 or v2")
     # Resolve before opening the controller; use one socket/source port per run.
     target = (socket.gethostbyname(ip), port)
     reader = None
@@ -40,26 +47,31 @@ def run_client(ip='127.0.0.1', port=5001, fps=60., debug=False):
 
     def send(state):
         nonlocal seq
-        packet = encode_state(state, session, seq)
+        if protocol == "v2":
+            packet = encode_v2_state(state, seq)
+        else:
+            packet = encode_state(state, session, seq)
         sock.sendto(packet, target)
         if debug:
-            logger.info('GAMEPAD TX to=%s:%s payload=%s', *target, packet.decode('utf-8'))
+            logger.info("GAMEPAD TX to=%s:%s payload=%s", *target, packet.decode("utf-8"))
         seq += 1
 
     try:
         reader = GamepadReader()
-        logger.info('Gamepad -> %s:%s at %g Hz (Ctrl-C to stop)', *target, fps)
+        logger.info("Gamepad -> %s:%s %s at %g Hz (Ctrl-C to stop)", *target, protocol, fps)
         while True:
             started = time.perf_counter()
             state = reader.read()
             present = state is not None
             if present != connected:
-                logger.info('Gamepad connected: %s' if present else 'No gamepad; sending disconnected state',
-                            *([reader.device_name] if present else []))
+                logger.info(
+                    "Gamepad connected: %s" if present else "No gamepad; sending disconnected state",
+                    *([reader.device_name] if present else []),
+                )
                 connected = present
             # Send idle states too: this heartbeat distinguishes rest from dropout.
             send(state)
-            time.sleep(max(0., 1./fps-(time.perf_counter()-started)))
+            time.sleep(max(0.0, 1.0 / fps - (time.perf_counter() - started)))
     except KeyboardInterrupt:
         pass
     finally:
@@ -74,27 +86,39 @@ def run_client(ip='127.0.0.1', port=5001, fps=60., debug=False):
 
 def debug_bool(value):
     text = str(value).lower()
-    if text in ('true', '1', 'yes', 'on'):
+    if text in ("true", "1", "yes", "on"):
         return True
-    if text in ('false', '0', 'no', 'off'):
+    if text in ("false", "0", "no", "off"):
         return False
-    raise argparse.ArgumentTypeError('debug must be true or false')
+    raise argparse.ArgumentTypeError("debug must be true or false")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--ip', default='127.0.0.1', help='Robot computer IP (default: 127.0.0.1)')
-    parser.add_argument('--port', type=int, default=5001, help='Robot UDP port (default: 5001)')
-    parser.add_argument('--fps', '--hz', type=float, default=60., help='State/heartbeat rate (default: 60 Hz)')
-    parser.add_argument('--debug', nargs='?', const=True, default=False, type=debug_bool,
-                        help='Print every transmitted packet, including axes/buttons (default: false)')
+    parser.add_argument("--ip", default="127.0.0.1", help="Robot computer IP (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=5001, help="Robot UDP port (default: 5001)")
+    parser.add_argument("--fps", "--hz", type=float, default=60.0, help="State/heartbeat rate (default: 60 Hz)")
+    parser.add_argument(
+        "--protocol",
+        choices=("v1", "v2"),
+        default="v2",
+        help="UDP schema: v2 named Porter/RevoPilot packet (default), or original gamepad_state v1",
+    )
+    parser.add_argument(
+        "--debug",
+        nargs="?",
+        const=True,
+        default=False,
+        type=debug_bool,
+        help="Print every transmitted packet, including axes/buttons (default: false)",
+    )
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format='%(levelname)s %(message)s')
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     try:
-        run_client(args.ip, args.port, args.fps, debug=args.debug)
+        run_client(args.ip, args.port, args.fps, debug=args.debug, protocol=args.protocol)
     except (ValueError, OSError, ImportError) as e:
-        parser.exit(1, f'{e}\n')
+        parser.exit(1, f"{e}\n")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

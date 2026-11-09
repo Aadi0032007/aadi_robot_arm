@@ -43,18 +43,18 @@ OVERRIDES_HELP = """\
 Configuration arguments use the same names as the lerobot CLI (lerobot-teleoperate / -record / -replay):
   --robot.type=so101_follower --robot.port=COM4 --robot.id=aadi_so101_follower
   --teleop.type=so101_leader --teleop.port=COM5 --teleop.id=aadi_so101_leader
-  --teleop.type=keyboard_joints --teleop.speed=30
   --teleop.type=gamepad_ee --port=5001   UDP gamepad on 0.0.0.0; omit --port for local USB
   --debug=true   Print received UDP gamepad packets and active mapped inputs (default: false)
-  --teleop.type=hand_ee --teleop.camera_index=0 --teleop.invert=y,yaw
-  --teleop.type=vr_ee --teleop.port=8443 --teleop.hand=right --teleop.position_scale=1.0
   --fps=30 --display_data=true --display_mode=rerun --play_sounds=false
   --dataset.repo_id=Aadi/so101_v1 --dataset.single_task="Pick the cube" --dataset.root=...
   --dataset.num_episodes=10 --dataset.episode_time_s=30 --dataset.reset_time_s=10
   --dataset.episode=0 --dataset.push_to_hub=true --dataset.video=false
+  --dataset.depth_encoder.depth_max=1.0 --dataset.depth_encoder.use_log=false   (convert: depth storage)
   --policy.path=<ckpt> --policy.device=cuda --dataset_repo_id=... --single_task=... --control_time_s=60
 Extra sections of this folder, same style:
   --cameras.wrist.source=0 --cameras.eye.enabled=false   or   --cameras=none
+  --cameras.eye.type=intelrealsense --cameras.eye.source=<serial> --cameras.eye.use_depth=true
+  --stream.enabled=true --stream.camera=eye --stream.port=8556 --stream.hw_encode=true   (RTSP for the dashboard)
   --sessions_root=<dir> --ai.action_port=5010 --record.codec=mp4v --replay.ramp_s=0
 Anything not given comes from the preset (--preset, default 'nero'). Setting --robot.type or
 --teleop.type discards the preset's other keys for that section. Values are parsed as
@@ -70,6 +70,10 @@ ALIASES = {
     "dataset.num_episodes": "record.num_episodes",
     "dataset.episode_time_s": "record.episode_time_s",
     "dataset.reset_time_s": "record.reset_time_s",
+    "dataset.depth_encoder.depth_min": "dataset.depth_min",
+    "dataset.depth_encoder.depth_max": "dataset.depth_max",
+    "dataset.depth_encoder.shift": "dataset.depth_shift",
+    "dataset.depth_encoder.use_log": "dataset.depth_use_log",
     "display_data": "record.display_data",
     "display_mode": "record.display_mode",
     "display_ip": "record.display_ip",
@@ -139,7 +143,7 @@ def load_config(preset: str | None = None, overrides: list[str] | dict[str, str]
 
 # ── CLI overrides ─────────────────────────────────────────────────────────────
 
-_SECTION_DATACLASSES = ("leader_client", "record", "dataset", "replay", "policy", "ai")
+_SECTION_DATACLASSES = ("leader_client", "record", "dataset", "replay", "policy", "ai", "stream")
 _SCALARS = ("fps", "task", "sessions_root", "lerobot_src")
 
 
@@ -229,8 +233,13 @@ def apply_overrides(cfg: ArmConfig, overrides: dict[str, str]) -> ArmConfig:
                 name, field_name = parts[1], parts[2]
                 cam = next((c for c in cfg.cameras if c.name == name), None)
                 if cam is None:
-                    cam = _config.CameraConfig(name=name, source=val if field_name == "source" else 0)
+                    cam = _config.CameraConfig(name=name, source=0)
                     cfg.cameras.append(cam)
+                if field_name == "serial_number_or_name":  # LeRobot's RealSense field name
+                    cam.type = "intelrealsense"
+                    field_name = "source"
+                if field_name == "source" and cam.is_realsense:
+                    val = raw.strip()  # serial numbers are digits: keep them as text
                 if not hasattr(cam, field_name):
                     raise SystemExit(f"--{key}: CameraConfig has no field '{field_name}'")
                 setattr(cam, field_name, val)
@@ -252,6 +261,18 @@ def apply_overrides(cfg: ArmConfig, overrides: dict[str, str]) -> ArmConfig:
             raise SystemExit(f"unknown override --{key}\n\n{OVERRIDES_HELP}")
     if 'port' in overrides and cfg.teleop_type != 'gamepad_ee':
         raise SystemExit('--port selects UDP input for --teleop.type=gamepad_ee only')
+    for cam in cfg.cameras:
+        if cam.is_realsense:
+            cam.source = str(cam.source)  # --cameras.x.type given after --cameras.x.source
+        try:
+            cam.validate()
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from None
+    if cfg.stream.enabled:
+        try:
+            cfg.stream_mounts()
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from None
     return cfg
 
 
@@ -339,13 +360,6 @@ def make_robot(cfg: ArmConfig):
 
 def make_teleop(cfg: ArmConfig):
     """LeRobot leader/teleoperator, or one of this folder's own input devices."""
-    if cfg.teleop_type == "keyboard_joints":
-        from .keyboard_teleop import KeyboardJointTeleop, KeyboardJointTeleopConfig
-
-        spec = dict(cfg.teleop)
-        spec.pop("type")
-        return KeyboardJointTeleop(_instantiate(KeyboardJointTeleopConfig, spec, "teleop"))
-
     if cfg.teleop_type == "gamepad_ee":
         from .gamepad_teleop import GamepadEETeleop, GamepadEETeleopConfig
 
@@ -353,30 +367,29 @@ def make_teleop(cfg: ArmConfig):
         spec.pop("type")
         return GamepadEETeleop(_instantiate(GamepadEETeleopConfig, spec, "teleop"))
 
-    if cfg.teleop_type == "hand_ee":
-        from .hand_teleop import HandEETeleop, HandEETeleopConfig
-
-        spec = dict(cfg.teleop)
-        spec.pop("type")
-        return HandEETeleop(_instantiate(HandEETeleopConfig, spec, "teleop"))
-
-    if cfg.teleop_type == "vr_ee":
-        from .vr_teleop import VREETeleop, VREETeleopConfig
-
-        spec = dict(cfg.teleop)
-        spec.pop("type")
-        return VREETeleop(_instantiate(VREETeleopConfig, spec, "teleop"))
-
     from lerobot.teleoperators import make_teleoperator_from_config
 
     return make_teleoperator_from_config(build_teleop_config(cfg))
 
 
+def _describe_camera(c: Any) -> str:
+    extras = []
+    if c.is_realsense:
+        extras.append("realsense")
+        if c.use_depth:
+            extras.append("depth" if c.use_rgb else "depth-only")
+    elif c.hw_decode:
+        extras.append("hw")
+    if c.publish_frames:
+        extras.append("bus")
+    return f"{c.name}({c.width}x{c.height}@{c.fps}{''.join(', ' + e for e in extras)})"
+
+
 def describe(cfg: ArmConfig) -> str:
-    cams = ", ".join(
-        f"{c.name}({c.width}x{c.height}@{c.fps}{', hw' if c.hw_decode else ''}{', bus' if c.publish_frames else ''})"
-        for c in cfg.enabled_cameras
-    ) or "none  (add --cameras.wrist.source=0 --cameras.eye.source=2)"
+    cams = ", ".join(_describe_camera(c) for c in cfg.enabled_cameras) or (
+        "none  (add --cameras.wrist.source=0 --cameras.eye.source=2, or "
+        "--cameras.eye.type=intelrealsense --cameras.eye.source=<serial> --cameras.eye.use_depth=true)"
+    )
     ai = (
         f"on  action udp:{cfg.ai.action_port}  state udp:{cfg.ai.state_port}"
         if cfg.ai.enabled
@@ -387,10 +400,23 @@ def describe(cfg: ArmConfig) -> str:
         f"  robot : {cfg.robot_type}  {_short(cfg.robot)}\n"
         f"  teleop: {cfg.teleop_type}  {_short(cfg.teleop)}\n"
         f"  cams  : {cams}\n"
+        f"  stream: {_describe_stream(cfg)}\n"
         f"  fps   : {cfg.fps}\n"
         f"  ai    : {ai}\n"
         f"  task  : {cfg.task!r}" + ("  (--dataset.single_task=... to set)" if not cfg.task else "")
     )
+
+
+def _describe_stream(cfg: ArmConfig) -> str:
+    s = cfg.stream
+    if not s.enabled:
+        return f"off (--stream.enabled=true serves rtsp://<this pc>:{s.port}/{s.mount} for MediaMTX)"
+    try:
+        mounts = cfg.stream_mounts()
+    except ValueError as exc:
+        return f"error: {exc}"
+    paths = "  ".join(f"/{m} <- {c.name}" for m, c in mounts.items())
+    return f"rtsp {s.bind}:{s.port}  {paths}  ({'nvv4l2h264enc' if s.hw_encode else 'x264enc'} {s.bitrate_kbps} kbps)"
 
 
 def _short(section: dict[str, Any]) -> str:

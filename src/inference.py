@@ -32,6 +32,7 @@ if __package__ in (None, ""):  # allow `python src/inference.py`
 import logging
 
 from .devices import describe, load_config, make_parser
+from .frame_bus import FrameBusStalled
 
 logger = logging.getLogger(__name__)
 
@@ -73,10 +74,12 @@ def main() -> None:
 
     robot = ArmProxyRobot(features=features, robot_type=cfg.robot_type, ai=cfg.ai)
     trained_cams = sorted(k for k, v in robot.observation_features.items() if isinstance(v, tuple))
-    if set(trained_cams) != set(cfg.camera_names):
+    configured = cfg.camera_observation_keys  # <name> and <name>_depth, same keys as the dataset
+    if set(trained_cams) != set(configured):
         logging.warning(
-            "policy was trained with cameras %s, config has %s. Frames come from the frame bus by name, "
-            "so teleop must publish exactly the trained names.", trained_cams, cfg.camera_names,
+            "policy was trained with image keys %s, config has %s. Frames come from the frame bus by name "
+            "(lab_<key>), so teleop must publish exactly the trained keys (depth needs --cameras.<name>.use_depth=true).",
+            trained_cams, configured,
         )
 
     print()
@@ -85,7 +88,7 @@ def main() -> None:
     print("=" * 66)
     print(f"  policy   : {policy_path}")
     print(f"  dataset  : {dataset_repo_id}")
-    print(f"  cameras  : {trained_cams}  ← frame bus lab_<name>")
+    print(f"  images   : {trained_cams}  ← frame bus lab_<key>  (<name> colour, <name>_depth depth)")
     print(f"  state    : udp://{cfg.ai.host}:{cfg.ai.state_port}  ← teleop")
     print(f"  actions  : udp://{cfg.ai.host}:{cfg.ai.action_port}  → teleop")
     print("  teleop must run with --ai.enabled=true (and the same --cameras.* as training).")
@@ -107,6 +110,8 @@ def main() -> None:
         )
     except KeyboardInterrupt:
         logging.info("Interrupted.")
+    except FrameBusStalled as exc:
+        logging.error("%s Inference stopped.", exc)
     finally:
         # Stop sending; teleop's action_ttl then makes the arm hold its pose.
         robot.disconnect()

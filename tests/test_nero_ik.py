@@ -1,5 +1,4 @@
-"""No CAN, servo enable, gamepad or headset access: numerical/fake SDK checks."""
-import ast
+"""No CAN, servo enable or gamepad access: numerical/fake SDK checks."""
 from dataclasses import dataclass
 import importlib.machinery
 from pathlib import Path
@@ -15,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from src.config import load
 from src.devices import make_robot
-from src.kinematics import IKResult, matrix_to_rotvec, rotvec_to_matrix
+from src.kinematics import IKResult
 from src.nero_ik import nero_kinematics, plan_cartesian, reachable
 from src.nero_robot import NeroJointRobot, NeroRobotConfig, NeroTrackingError, NERO_JOINTS
 
@@ -66,7 +65,7 @@ class NeroIKTests(unittest.TestCase):
 
     def test_presets_preserve_leader_and_construct_native(self):
         self.assertEqual(load('nero').robot_type,'agx_nero_follower')
-        for name in ('nero_cartesian','nero_gamepad','nero_vr'):
+        for name in ('nero_cartesian','nero_gamepad'):
             cfg = load(name)
             self.assertEqual(cfg.robot_type,'agx_nero_native')
             self.assertNotIn('teleop_action_joints',cfg.robot)
@@ -82,15 +81,17 @@ class NeroIKTests(unittest.TestCase):
         self.sent = []
         return robot
 
-    def test_native_order_no_leader_offsets_and_limit_rejection(self):
+    def test_native_order_no_leader_offsets_and_limit_clipping(self):
         robot = self.native()
         action = {f'joint{i}.pos':float(i) for i in reversed(range(1,8))}
         robot.send_action(action)
         np.testing.assert_allclose(self.sent[0],np.radians(np.arange(1,8)))
-        for value in (float('nan'),200.):
-            with self.assertRaises(ValueError):
-                robot.send_action({'joint1.pos':value})
+        with self.assertRaises(ValueError):
+            robot.send_action({'joint1.pos':float('nan')})
         self.assertEqual(len(self.sent),1)
+        robot.send_action({'joint1.pos':200.})
+        self.assertEqual(len(self.sent),2)
+        self.assertAlmostEqual(self.sent[-1][0], np.radians(robot._upper[0]))
         robot.config.max_relative_target = 1.
         with self.assertRaises(ValueError):
             robot.send_action({'joint1.pos':2.})
@@ -207,12 +208,12 @@ class TeleopIntegrationTests(unittest.TestCase):
                 self.assertLess(float(np.dot(*deltas)),0.)
 
     def test_old_pitch_and_gripper_buttons_do_not_move_robot(self):
-        from src.gamepad import GamepadState, BTN_A, BTN_B, BTN_RT, BTN_LT
+        from src.gamepad import GamepadState, BTN_A, BTN_RT, BTN_LT
         control=self.nero_gamepad_control()
         obs=dict(zip(control.kin.keys,[0,20,0,60,0,10,0]))
         obs['gripper.pos']=40.
         control.seed_from_observation(obs)
-        for button in (BTN_A, BTN_B, BTN_RT, BTN_LT):
+        for button in (BTN_A, BTN_RT, BTN_LT):
             with self.subTest(button=button):
                 state=GamepadState()
                 state.buttons[button]={'pressed':True,'value':1.}
@@ -224,8 +225,64 @@ class TeleopIntegrationTests(unittest.TestCase):
                                            [obs[k] for k in control.kin.keys],atol=1e-12)
                 self.assertEqual(action['gripper.pos'],40.)
 
+    def test_b_glides_to_look_pose(self):
+        from src.gamepad import GamepadState, BTN_B
+        control=self.nero_gamepad_control()
+        self.assertTrue(control.config.look_on_b)
+        seed=[0.,20.,0.,60.,0.,10.,0.]
+        obs=dict(zip(control.kin.keys,seed))
+        obs['gripper.pos']=40.
+        control.seed_from_observation(obs)
+        state=GamepadState()
+        state.buttons[BTN_B]={'pressed':True,'value':1.}
+        control._reader=SimpleNamespace(read=lambda:state)
+        control._last_t=99.0
+        with patch('src.gamepad_teleop.time.perf_counter',return_value=100.):
+            action=control.get_action()
+        self.assertTrue(control._gliding)
+        self.assertEqual(control._glide_name,'look')
+        self.assertEqual(action['gripper.pos'],40.)
+        np.testing.assert_allclose(np.degrees(control._q_glide), control.config.look_deg, atol=0.05)
+        with patch('src.gamepad_teleop.time.perf_counter',return_value=101.):
+            later=control.get_action()
+        self.assertGreater(np.max(np.abs(control._q-np.radians(seed))),1e-6)
+        self.assertEqual(later['gripper.pos'],40.)
+
+
+    def test_pose_glide_stays_within_tracking_limit_on_slow_tick(self):
+        control=self.nero_gamepad_control()
+        seed=[0.,20.,0.,60.,0.,10.,0.]
+        obs=dict(zip(control.kin.keys,seed))
+        obs['gripper.pos']=40.
+        control.seed_from_observation(obs)
+        control._start_named_pose('look', control.config.look_pose_file, control.config.look_deg, 30., 2.)
+        self.assertTrue(control._gliding)
+        control._step_glide(1.0)  # a stalled loop; old wall-clock path jumped ~30 deg
+        jumped=float(np.max(np.abs(np.degrees(control._q-np.radians(seed)))))
+        self.assertLessEqual(jumped, control._glide_max_step_deg()+1e-6)
+        self.assertGreater(jumped, 1e-6)
+        self.assertTrue(control._gliding)
+
+
+    def test_pose_glide_holds_on_tracking_reject_instead_of_pausing(self):
+        control=self.nero_gamepad_control()
+        seed=[0.,20.,0.,60.,0.,10.,0.]
+        obs=dict(zip(control.kin.keys,seed))
+        obs['gripper.pos']=40.
+        control.seed_from_observation(obs)
+        control._start_named_pose('look', None, control.config.look_deg, 30., 2.)
+        control._step_glide(0.1)
+        held=dict(obs)
+        held['joint2.pos']=22.
+        control.on_target_rejected(held)
+        self.assertTrue(control._gliding)
+        self.assertFalse(control._tracking_paused)
+        self.assertAlmostEqual(np.degrees(control._q[1]),22.)
+        self.assertAlmostEqual(np.degrees(control._measured_q[1]),22.)
+
+
     def test_optional_deadman_uses_lt_without_opening_gripper(self):
-        from src.gamepad import GamepadState, BTN_RB, BTN_LT
+        from src.gamepad import GamepadState, BTN_LB, BTN_LT
         control=self.nero_gamepad_control()
         control.config.require_deadman=True
         control.config.gripper_needs_deadman=True
@@ -233,7 +290,7 @@ class TeleopIntegrationTests(unittest.TestCase):
         obs['gripper.pos']=40.
         control.seed_from_observation(obs)
         state=GamepadState(axes=[0.,-.5,0.,0.])
-        state.buttons[BTN_RB]={'pressed':True,'value':1.}
+        state.buttons[BTN_LB]={'pressed':True,'value':1.}
         control._reader=SimpleNamespace(read=lambda:state)
         def tick():
             control._last_t=99.95
@@ -242,13 +299,14 @@ class TeleopIntegrationTests(unittest.TestCase):
         held=tick()
         self.assertEqual(held['gripper.pos'],40.)
         np.testing.assert_allclose(control._q,np.radians([0,20,0,60,0,10,0]))
-        state.buttons[BTN_RB]={'pressed':False,'value':0.}
+        state.buttons[BTN_LB]={'pressed':False,'value':0.}
         state.buttons[BTN_LT]={'pressed':True,'value':1.}
         enabled=tick()
         self.assertGreater(np.linalg.norm(control._q-np.radians([0,20,0,60,0,10,0])),1e-6)
         self.assertEqual(enabled['gripper.pos'],40.)
-        state.buttons[BTN_RB]={'pressed':True,'value':1.}
+        state.buttons[BTN_LB]={'pressed':True,'value':1.}
         self.assertGreater(tick()['gripper.pos'],40.)
+
 
     def test_no_udp_input_does_not_enable_commands_and_reanchors_drift(self):
         from src.gamepad import GamepadState
@@ -273,7 +331,7 @@ class TeleopIntegrationTests(unittest.TestCase):
         self.assertAlmostEqual(first['gripper.pos'],45.)
 
     def test_tracking_error_pauses_until_neutral_and_then_resumes(self):
-        from src.gamepad import GamepadState,BTN_RB
+        from src.gamepad import GamepadState,BTN_LB
         control=self.nero_gamepad_control()
         q=np.array([0.,20.,0.,60.,0.,10.,0.])
         obs=dict(zip(control.kin.keys,q))
@@ -283,7 +341,7 @@ class TeleopIntegrationTests(unittest.TestCase):
         control._q[0]+=np.radians(7.)
         control.update_observation(obs)
         held=GamepadState(axes=[0.,-.5,0.,0.])
-        held.buttons[BTN_RB]={'pressed':True,'value':1.}
+        held.buttons[BTN_LB]={'pressed':True,'value':1.}
         control._reader=SimpleNamespace(read=lambda:held)
         paused=control.get_action()
         self.assertFalse(control.command_ready)
@@ -298,6 +356,7 @@ class TeleopIntegrationTests(unittest.TestCase):
             resumed=control.get_action()
         self.assertGreater(resumed['gripper.pos'],40.)
         self.assertGreater(np.max(np.abs(control._q-np.radians(q))),1e-6)
+
 
     def test_driver_rejection_between_reads_reanchors_and_latches_pause(self):
         from src.gamepad import GamepadState
@@ -360,7 +419,7 @@ class TeleopIntegrationTests(unittest.TestCase):
         np.testing.assert_allclose(teleop._floor(np.array([.2,0,.02]),np.array([.201,0,.019])),[.201,0,.02])
 
     def test_nero_sticks_and_bumpers_send_seven_joints_and_gripper_without_deadman(self):
-        from src.gamepad import GamepadState, BTN_RB, BTN_LB, BTN_LT
+        from src.gamepad import GamepadState, BTN_LB, BTN_RB, BTN_LT
         from src.gamepad_teleop import GamepadEETeleop,GamepadEETeleopConfig
         for mode in ('width','angle'):
             with self.subTest(feedback_mode=mode):
@@ -388,7 +447,7 @@ class TeleopIntegrationTests(unittest.TestCase):
                 self.assertAlmostEqual(teleop._gripper,40.)
                 state=GamepadState()
                 state.axes[1]=-.5  # translation plus gripper input, without LT
-                state.buttons[BTN_RB]={'pressed':True,'value':1.}
+                state.buttons[BTN_LB]={'pressed':True,'value':1.}
                 self.assertFalse(state.pressed(BTN_LT))
                 teleop._reader=SimpleNamespace(read=lambda:state)
                 teleop._last_t=99.95
@@ -402,8 +461,8 @@ class TeleopIntegrationTests(unittest.TestCase):
                 self.assertEqual(gripper_targets[-1][0],mode)
                 scale=1000. if mode=='width' else 1.
                 self.assertAlmostEqual(gripper_targets[-1][1],opened['gripper.pos']/scale)
-                state.buttons[BTN_RB]={'pressed':False,'value':0.}
-                state.buttons[BTN_LB]={'pressed':True,'value':1.}
+                state.buttons[BTN_LB]={'pressed':False,'value':0.}
+                state.buttons[BTN_RB]={'pressed':True,'value':1.}
                 teleop._last_t=99.95
                 with patch('src.gamepad_teleop.time.perf_counter',return_value=100.):
                     closed=teleop.get_action()
@@ -411,24 +470,6 @@ class TeleopIntegrationTests(unittest.TestCase):
                 robot.send_action(closed)
                 self.assertLess(gripper_targets[-1][1],gripper_targets[-2][1])
 
-    def test_vr_full_orientation_keeps_position(self):
-        from src.vr_teleop import VREETeleop,VREETeleopConfig,_Sample
-        spec=dict(load('nero_vr').teleop)
-        spec.pop('type')
-        teleop=VREETeleop(VREETeleopConfig(**spec))
-        q=np.radians([0,20,0,60,0,10,0])
-        T=teleop.kin.fk(q)
-        teleop._q_ik=q.copy()
-        teleop._p0,teleop._R0=T[:3,3],T[:3,:3]
-        teleop._align=teleop._H0=np.eye(3)
-        teleop._c0=np.zeros(3)
-        teleop._z_floor=None
-        teleop._precision=False
-        H=rotvec_to_matrix([0,0,.02])
-        result=teleop._goal(_Sample(np.zeros(3),H,1.,0.))
-        reached=teleop.kin.fk(result)
-        self.assertLess(np.linalg.norm(reached[:3,3]-T[:3,3]),.001)
-        self.assertLess(np.linalg.norm(matrix_to_rotvec((H@T[:3,:3])@reached[:3,:3].T)),np.radians(1.5))
 
     def test_udp_and_local_gamepad_produce_same_robot_commands(self):
         import select

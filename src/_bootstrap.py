@@ -4,7 +4,7 @@ Resolution order:
 
 1. ``lerobot`` is already importable (pip / editable install)  -> nothing to do
 2. ``$LEROBOT_SRC``                                             -> ``<lerobot repo>/src``
-3. ``lerobot_src`` from the JSON config                          -> same
+3. ``ArmConfig.lerobot_src`` from ``config.py``                  -> same
 4. ``../../src`` relative to this file                           -> works while this folder
                                                                    lives inside the LeRobot repo
 """
@@ -42,5 +42,5 @@ def ensure_lerobot_importable(config_hint: str | os.PathLike | None = None) -> P
     raise ImportError(
         "Could not import `lerobot`. Either install the LeRobot repo into this environment "
         "(`pip install -e <lerobot repo>`), set the LEROBOT_SRC environment variable to "
-        "`<lerobot repo>/src`, or set `lerobot_src` in the arm config JSON."
+        "`<lerobot repo>/src`, or set `lerobot_src` in src/config.py."
     )

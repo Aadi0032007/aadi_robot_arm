@@ -3,16 +3,21 @@
 ::
 
     <run>/session_<i>/
-        data.jsonl          one row per frame (see README §2)
+        data.jsonl          one row per frame (see README §3)
         meta.json           schema, fps, camera shapes, frame count
-        video_<cam>.mp4     one file per camera key, frame i == data.jsonl row i
+        video_<cam>.mp4     one mp4 per colour camera key, frame i == data.jsonl row i
+        <cam>_depth.u16     one raw file per depth key: frames of uint16 mm, (H, W), back to back
 
 ``SessionWriter`` is passed to LeRobot's ``record_loop`` in place of a
 ``LeRobotDataset``. The loop only touches three members, ``fps``, ``features`` and
 ``add_frame(frame)``, and the frames it hands over are already packed by
 ``build_dataset_frame`` (``observation.state`` / ``observation.images.<cam>`` /
 ``action`` / ``task``). The writer unpacks them back into named joint values for the
-JSONL and streams the images to one mp4 per camera on a background thread.
+JSONL and streams the images to one mp4 per colour camera on a background thread.
+Depth maps (features with ``info.is_depth_map`` / one channel, LeRobot's
+``<cam>_depth`` keys) are appended losslessly to a raw ``uint16`` file instead, since a
+video codec would destroy the millimetre values; ``convert.py`` hands them to
+``LeRobotDataset``, which encodes them with LeRobot's own depth video encoder.
 
 ``state_names`` and ``action_names`` are kept separately, so robots whose observation
 has more joints than their action (the Nero follower observes 8, a Koch leader
@@ -51,6 +56,38 @@ _STOP = object()
 
 def video_filename(camera_key: str) -> str:
     return f"video_{camera_key}.mp4"
+
+
+def depth_filename(camera_key: str) -> str:
+    return f"{camera_key}.u16"
+
+
+def is_depth_feature(feature: dict[str, Any]) -> bool:
+    info = feature.get("info") or {}
+    shape = tuple(feature.get("shape") or ())
+    return bool(info.get("is_depth_map")) or (len(shape) == 3 and shape[2] == 1)
+
+
+class _RawDepthWriter:
+    """Appends uint16 (H, W[, 1]) frames to one binary file; same ``write``/``release`` surface
+    as ``cv2.VideoWriter`` so the drain loop treats both alike."""
+
+    def __init__(self, path: Path, height: int, width: int) -> None:
+        self.height, self.width = int(height), int(width)
+        self._f = open(path, "wb")
+
+    def write(self, frame: np.ndarray) -> None:
+        frame = np.asarray(frame)
+        if frame.ndim == 3:
+            frame = frame[..., 0]
+        if frame.shape != (self.height, self.width):
+            import cv2
+
+            frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_NEAREST)
+        self._f.write(np.ascontiguousarray(frame, dtype=np.uint16).tobytes())
+
+    def release(self) -> None:
+        self._f.close()
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +191,9 @@ class SessionWriter:
             for key, ft in features.items()
             if ft.get("dtype") in ("image", "video") and key.startswith(IMAGE_PREFIX)
         }
+        self._depth_keys: set[str] = {  # camera keys that hold uint16 depth maps
+            cam for key, cam in self._image_keys.items() if is_depth_feature(features[key])
+        }
 
         self._meta: dict[str, Any] = dict(meta or {})
         self._meta.setdefault("session_name", self.session_dir.name)
@@ -239,18 +279,21 @@ class SessionWriter:
         duration = 0.0 if self._t0 is None else max(0.0, time.perf_counter() - self._t0)
         self._meta["num_frames"] = self.num_frames
         self._meta["duration_s"] = round(duration, 3)
-        self._meta["cameras"] = {
-            cam: {
-                "height": shape[0],
-                "width": shape[1],
-                "channels": shape[2] if len(shape) > 2 else 1,
-                "video": video_filename(cam),
-            }
-            for cam, shape in self._camera_shapes.items()
-        }
+        cameras: dict[str, dict[str, Any]] = {}
+        for cam, shape in self._camera_shapes.items():
+            entry: dict[str, Any] = {"height": shape[0], "width": shape[1]}
+            if cam in self._depth_keys:
+                entry.update(channels=1, dtype="uint16", unit="mm", depth=depth_filename(cam))
+            else:
+                entry.update(channels=shape[2] if len(shape) > 2 else 1, dtype="uint8", video=video_filename(cam))
+            cameras[cam] = entry
         # Cameras that never delivered a frame still need an entry so convert.py can complain clearly.
         for cam in self._image_keys.values():
-            self._meta["cameras"].setdefault(cam, {"video": video_filename(cam)})
+            if cam in self._depth_keys:
+                cameras.setdefault(cam, {"depth": depth_filename(cam)})
+            else:
+                cameras.setdefault(cam, {"video": video_filename(cam)})
+        self._meta["cameras"] = cameras
 
         (self.session_dir / META_FILENAME).write_text(json.dumps(self._meta, indent=2), encoding="utf-8")
         return self.session_dir
@@ -277,6 +320,10 @@ class SessionWriter:
                     writer = self._open_writer(cv2, cam_key, image.shape)
                     self._writers[cam_key] = writer
 
+                if cam_key in self._depth_keys:
+                    writer.write(image)  # raw uint16, resized inside if needed
+                    continue
+
                 expected = self._camera_shapes[cam_key]
                 if tuple(image.shape[:2]) != tuple(expected[:2]):
                     image = cv2.resize(image, (expected[1], expected[0]))
@@ -291,6 +338,8 @@ class SessionWriter:
 
     def _open_writer(self, cv2, cam_key: str, shape: tuple[int, ...]):
         height, width = int(shape[0]), int(shape[1])
+        if cam_key in self._depth_keys:
+            return _RawDepthWriter(self.session_dir / depth_filename(cam_key), height, width)
         path = self.session_dir / video_filename(cam_key)
         fourcc = cv2.VideoWriter_fourcc(*self.codec)
         writer = cv2.VideoWriter(str(path), fourcc, float(self.fps), (width, height))
@@ -305,16 +354,18 @@ class SessionWriter:
 
 
 class SessionFrames:
-    """Iterate ``(row, {camera_key: rgb_uint8})`` over one session.
+    """Iterate ``(row, {camera_key: image})`` over one session: colour keys give RGB uint8
+    (H, W, 3), depth keys give uint16 mm (H, W, 1), exactly what the live observation held.
 
-    Stops at the shortest of the JSONL and every video, exactly like the AGV converter.
+    Stops at the shortest of the JSONL and every video / depth file, like the AGV converter.
     """
 
     def __init__(self, session_dir: Path):
         self.session_dir = Path(session_dir)
         self.meta = load_meta(self.session_dir)
         self.rows = load_rows(self.session_dir)
-        self._caps: dict[str, Any] = {}
+        self._caps: dict[str, Any] = {}         # colour: cv2.VideoCapture
+        self._depth: dict[str, np.ndarray] = {}  # depth: memmap (n, H, W) uint16
         self._warned_resize: set[str] = set()
 
     @property
@@ -325,6 +376,15 @@ class SessionFrames:
         import cv2
 
         for cam, info in self.meta.get("cameras", {}).items():
+            if "depth" in info:
+                path = self.session_dir / info["depth"]
+                h, w = info.get("height"), info.get("width")
+                if not path.is_file() or not h or not w:
+                    self.__exit__(None, None, None)
+                    raise RuntimeError(f"Depth file {path} missing or its shape is not in meta.json")
+                n = path.stat().st_size // (int(h) * int(w) * 2)
+                self._depth[cam] = np.memmap(path, dtype=np.uint16, mode="r", shape=(n, int(h), int(w)))
+                continue
             path = self.session_dir / info.get("video", video_filename(cam))
             cap = cv2.VideoCapture(str(path))
             if not cap.isOpened():
@@ -337,6 +397,7 @@ class SessionFrames:
         for cap in self._caps.values():
             cap.release()
         self._caps.clear()
+        self._depth.clear()
 
     def __len__(self) -> int:
         import cv2
@@ -344,6 +405,8 @@ class SessionFrames:
         n = len(self.rows)
         for cap in self._caps.values():
             n = min(n, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
+        for arr in self._depth.values():
+            n = min(n, int(arr.shape[0]))
         return n
 
     def __iter__(self) -> Iterator[tuple[dict[str, Any], dict[str, np.ndarray]]]:
@@ -365,6 +428,8 @@ class SessionFrames:
                         self._warned_resize.add(cam)
                     bgr = cv2.resize(bgr, (info["width"], info["height"]))
                 images[cam] = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            for cam, arr in self._depth.items():
+                images[cam] = np.array(arr[i])[..., np.newaxis]  # (H, W, 1) uint16, copied out of the memmap
             yield self.rows[i], images
 
 

@@ -11,8 +11,8 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.config import load
 from src.devices import apply_overrides, parse_overrides
-from src.gamepad import GamepadState, BTN_A, BTN_RT
-from src.gamepad_udp import UDPGamepadReader, decode_state, encode_state
+from src.gamepad import GamepadState, BTN_A, BTN_DPAD_RIGHT, BTN_LB, BTN_RB, BTN_RT
+from src.gamepad_udp import UDPGamepadReader, decode_state, encode_state, encode_v2_state
 from src.gamepad_remote_client import run_client, main as client_main
 
 
@@ -121,7 +121,7 @@ class UDPGamepadTests(unittest.TestCase):
         with patch('src.gamepad_remote_client.GamepadReader',return_value=reader), \
              patch('src.gamepad_remote_client.time.sleep',side_effect=KeyboardInterrupt), \
              self.assertLogs('src.gamepad_remote_client',level='INFO') as tx:
-            run_client('127.0.0.1',self.reader.address[1],debug=True)
+            run_client('127.0.0.1',self.reader.address[1],debug=True,protocol='v1')
         self.assertTrue(select.select([self.reader._sock],[],[],.5)[0])
         with self.assertLogs('src.gamepad_udp',level='INFO') as rx:
             self.reader.read()
@@ -165,7 +165,7 @@ class UDPGamepadTests(unittest.TestCase):
              patch('src.gamepad_remote_client.socket.socket',return_value=sock), \
              patch('src.gamepad_remote_client.socket.gethostbyname',return_value='127.0.0.1'), \
              patch('src.gamepad_remote_client.time.sleep',side_effect=KeyboardInterrupt):
-            run_client()
+            run_client(protocol='v1')
         first,disconnect=packets[:2]
         session,seq,received=decode_state(first[0])
         end_session,end_seq,empty=decode_state(disconnect[0])
@@ -175,6 +175,58 @@ class UDPGamepadTests(unittest.TestCase):
         self.assertGreater(end_seq,seq)
         self.assertIsNone(empty)
         self.assertEqual(packets[-2:],['socket closed','reader closed'])
+
+    def test_v2_named_packet_roundtrip_and_brake_hold(self):
+        state=GamepadState(axes=[-.5,.25,.1,-1.])
+        state.buttons[BTN_A]={'pressed':True,'value':1.}
+        state.buttons[BTN_LB]={'pressed':True,'value':1.}
+        state.buttons[BTN_RB]={'pressed':False,'value':0.}
+        state.buttons[BTN_DPAD_RIGHT]={'pressed':True,'value':1.}
+        packet=encode_v2_state(state,7)
+        msg=json.loads(packet)
+        self.assertEqual(msg['protocol'],'v2')
+        self.assertEqual(msg['seq'],7)
+        self.assertEqual(msg['brake'],0)
+        self.assertEqual(msg['A'],1.)
+        self.assertEqual(msg['L1'],1.)
+        self.assertEqual(msg['R1'],0.)
+        self.assertEqual(msg['lx'],-.5)
+        self.assertEqual(msg['dx'],1.)
+        session,seq,received=decode_state(packet)
+        self.assertEqual(session,'v2')
+        self.assertEqual(seq,7)
+        self.assertEqual(received.axes,state.axes)
+        self.assertTrue(received.pressed(BTN_A))
+        self.assertTrue(received.pressed(BTN_LB))
+        self.assertTrue(received.pressed(BTN_DPAD_RIGHT))
+        self.sender.sendto(packet,self.reader.address)
+        self.assertTrue(select.select([self.reader._sock],[],[],.5)[0])
+        live=self.reader.read()
+        self.assertEqual(live.axes,state.axes)
+        self.assertTrue(live.pressed(BTN_LB))
+        stop=encode_v2_state(None,8)
+        self.sender.sendto(stop,self.reader.address)
+        self.assertTrue(select.select([self.reader._sock],[],[],.5)[0])
+        self.assertIsNone(self.reader.read())
+
+    def test_client_default_protocol_is_v2(self):
+        packets=[]
+        state=GamepadState(axes=[.2,0.,0.,0.])
+        reader=SimpleNamespace(read=lambda:state,device_name='fake pad',close=lambda:None)
+        sock=SimpleNamespace(sendto=lambda data,target:packets.append(data),close=lambda:None)
+        with patch('src.gamepad_remote_client.GamepadReader',return_value=reader), \
+             patch('src.gamepad_remote_client.socket.socket',return_value=sock), \
+             patch('src.gamepad_remote_client.socket.gethostbyname',return_value='127.0.0.1'), \
+             patch('src.gamepad_remote_client.time.sleep',side_effect=KeyboardInterrupt):
+            run_client()
+        session,seq,received=decode_state(packets[0])
+        self.assertEqual(json.loads(packets[0])['protocol'],'v2')
+        self.assertEqual(received.axes,[.2,0.,0.,0.])
+        self.assertIsNone(decode_state(packets[1])[2])
+        with patch('sys.argv',['gamepad_remote_client']), \
+             patch('src.gamepad_remote_client.run_client') as run:
+            client_main()
+            self.assertEqual(run.call_args.kwargs['protocol'],'v2')
 
 
 if __name__=='__main__':

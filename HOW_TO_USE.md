@@ -5,7 +5,7 @@ LeRobot's dependencies (the one you already use for `lerobot-teleoperate`):
 
 ```bash
 cd revobots_arm
-python -m src.<tool> [--preset nero|koch|so101|so101_remote|so101_keyboard] [lerobot-style args]
+python -m src.<tool> [--preset nero|nero_gamepad|koch|so101|so101_remote|so101_gamepad] [lerobot-style args]
 ```
 
 **Arguments use the same names as the lerobot CLI**, so a `lerobot-teleoperate` or
@@ -17,9 +17,12 @@ Spoken prompts are off by default here (`--play_sounds=true` turns them on).
 or `REVOBOTS_ARM_PRESET`). Flags that have no lerobot equivalent follow the same style
 (`--run_dir`, `--sessions_dir`, `--session_dir`, `--cameras.wrist.source=0`, `--ai.action_port=5010`).
 
-**Off unless you ask for them**: cameras (`--cameras.wrist.source=0 --cameras.eye.source=2`),
-the task string (`--dataset.single_task="..."`), and the AI link to `inference.py`
-(`--ai.enabled=true`). A bare teleop command therefore moves the arm and records joints only.
+**Off unless you ask for them**: cameras (`--cameras.wrist.source=0 --cameras.eye.source=2`,
+or a RealSense with depth: `--cameras.eye.type=intelrealsense --cameras.eye.source=<serial>
+--cameras.eye.use_depth=true`), the task string (`--dataset.single_task="..."`), the AI
+link to `inference.py` (`--ai.enabled=true`) and the RTSP stream for the dashboard
+(`--stream.enabled=true`). A bare teleop command therefore moves the arm and records
+joints only.
 
 Contents
 
@@ -49,7 +52,7 @@ Contents
    | `koch` | Koch follower over serial | Koch leader on another PC | `robot["port"]` (`COM4`, `/dev/ttyACM0`) |
    | `so101` | SO-101 follower (`COM4`, id `aadi_so101_follower`) | SO-101 leader on the same PC (`COM5`, id `aadi_so101_leader`) | `robot["port"]`, `teleop["port"]` |
    | `so101_remote` | SO-101 follower | SO-101 leader on another PC (UDP 5002) | `robot["port"]`, `leader_client.com` |
-   | `so101_keyboard` | SO-101 follower | keyboard joint jog, no leader, no IK | `robot["port"]`, `teleop["speed"]` |
+   | `so101_gamepad` / `nero_gamepad` | SO-101 / Nero follower | USB or UDP gamepad, Cartesian jog through URDF IK | `robot["port"]` (section 11b, NERO_IK.md) |
 
    Also set `task` (`--dataset.single_task`), `dataset.repo_id`, and the two camera
    sources (section 2).
@@ -70,58 +73,147 @@ Contents
 
 ## 2. Cameras
 
-Two cameras are configured, `wrist` and `eye`. Their names become
-`observation.images.wrist` / `observation.images.eye` in the dataset, and the frame bus
-regions `lab_wrist` / `lab_eye` for other processes.
+Two camera types, picked per camera with `type`, same names as LeRobot's camera registry:
+
+| `type` | `source` | Captured by | Extras |
+| --- | --- | --- | --- |
+| `opencv` (default) | index on Windows, `/dev/videoN` on Linux | OpenCV, or the Jetson GStreamer pipeline (`hw_decode`) | `pixel_format` |
+| `intelrealsense` | serial number (or unique device name) | `pyrealsense2` directly, same arrays as LeRobot's `RealSenseCamera` (`pip install pyrealsense2`) | `use_depth`, `use_rgb`, `warmup_s` |
+
+A camera `name` becomes `observation.images.<name>` in the dataset and the frame bus
+region `lab_<name>` for other processes. A RealSense with `use_depth=true` adds
+`observation.images.<name>_depth` (uint16 millimetres, shape `(H, W, 1)`, flagged
+`is_depth_map` like `lerobot-record` does) and the bus region `lab_<name>_depth`.
 
 ### Find the devices
 
 ```bash
-python -m src.cameras find
+python -m src.cameras find              # OpenCV devices, then RealSense serial numbers
+python -m src.cameras find realsense
 ```
 
 Prints every device OpenCV can open, its default mode, and whether it delivers a frame.
 On Linux each physical camera usually shows two `/dev/video*` nodes; the one that says
-`ok` is the capture node, the other is metadata. Put the capture node in the config, or
-pass it on the command line:
+`ok` is the capture node, the other is metadata. RealSense devices are listed with their
+serial number, which is what goes into `source`. Put them in the config, or pass them on
+the command line:
 
 ```python
 # src/config.py
 def default_cameras() -> list[CameraConfig]:
     return [
-        CameraConfig(name="wrist", source=video(0)),   # /dev/video0 on Linux, index 0 on Windows
-        CameraConfig(name="eye",   source=video(2)),
+        CameraConfig(name="wrist", source=video(0)),                   # /dev/video0 on Linux, index 0 on Windows
+        realsense("eye", "123456789012", use_depth=True),              # RealSense colour + depth
     ]
 ```
 
 ```bash
---cameras.wrist.source=0 --cameras.eye.source=2        # per-camera fields: source width height fps
---cameras.eye.enabled=false                             #   pixel_format rotation publish_frames hw_decode
---cameras=none                                          # run without cameras
+--cameras.wrist.source=0 --cameras.eye.source=2                      # per-camera fields: source width height fps
+--cameras.eye.enabled=false                                           #   pixel_format rotation publish_frames hw_decode
+--cameras.eye.type=intelrealsense --cameras.eye.source=123456789012   # RealSense, colour only
+--cameras.eye.type=intelrealsense --cameras.eye.source=123456789012 --cameras.eye.use_depth=true
+--cameras.eye.serial_number_or_name=123456789012                      # LeRobot's field name, implies type=intelrealsense
+--cameras=none                                                        # run without cameras
 ```
 
-### Hardware decode and fallback
+### Hardware decode and fallback (opencv)
 
 `hw_decode=True` opens a Jetson GStreamer pipeline (`v4l2src → nvv4l2decoder → nvvidconv`)
 inside OpenCV. If that pipeline cannot open, capture falls back to plain OpenCV V4L2 on
 its own and logs one warning. The default is on when running on a Jetson
 (`/etc/nv_tegra_release` exists) and off elsewhere.
 
+### Depth (intelrealsense)
+
+With `use_depth=true` the depth map rides along everywhere the colour image does:
+
+- **teleop / record** store it losslessly in the session as `<name>_depth.u16`
+  (raw uint16 frames, no codec).
+- **convert** turns it into `observation.images.<name>_depth` and `LeRobotDataset`
+  encodes it with LeRobot's own depth video encoder, so training sees exactly what a
+  `lerobot-record` dataset with a RealSense would contain.
+- **inference** reads it from the bus `lab_<name>_depth` and feeds it to the policy as
+  uint16, untouched; the policy's preprocessor applies the dataset stats as usual.
+
+`use_rgb=false` gives a depth-only camera (then there is no `<name>` colour key).
+Colour and depth use the same `width`/`height`/`fps` and come from one frameset, so
+colour frame N and depth frame N in a session were captured together. Depth is not
+aligned to colour, as in LeRobot. The depth sensor is switched to 1 mm units at start,
+so a D405 (which ships at 0.1 mm) also records true millimetres.
+
 ### Check they run
 
 ```bash
 python -m src.cameras test --record_time_s=5 --cameras.wrist.source=0 --cameras.eye.source=2
-python -m src.cameras preview --preset so101            # one window per camera, q to quit
+python -m src.cameras preview --preset so101            # one window per stream (depth colour-mapped), q to quit
 ```
 
 `test` should report an fps close to the configured one. If it is far below, the USB
-bus is saturated (try `pixel_format="MJPG"`, a lower resolution, or another port).
+bus is saturated (try `pixel_format="MJPG"`, a lower resolution, or another port). A
+RealSense wants a USB 3 port; the `find` output shows the negotiated USB type.
 
 ### Who reads the frames
 
 - `teleop.py` and `record.py` read the in-process latest frame.
 - `inference.py` reads the frame bus, which teleop publishes (`publish_frames=True`).
   Nothing else has to open the camera, so teleop and inference run at the same time.
+  Any other process can do the same: `FrameBusReader("eye")` / `FrameBusReader("eye_depth")`
+  from `src/frame_bus.py` returns the newest frame as a copy, never blocking teleop.
+- The RTSP stream (next section) reads the frame bus too, from inside teleop.
+
+Inference and the RTSP stream read through `HoldLastReader`: when the camera dropped or
+skipped a frame since the last read, the previous frame is used again, at most 30 times
+in a row (`--ai.max_repeated_frames`, `--stream.max_repeated_frames`). A new frame resets
+the count. After 30 repeats with no new frame (one second at 30 fps), inference exits and
+the RTSP mount stops, each with an error naming the camera and the frame bus:
+
+```
+camera 'wrist': frame bus lab_wrist delivered no new frame for 30 reads in a row (last frame
+reused 30 times). Is the camera still connected and teleop still running?
+```
+
+### Dashboard stream (RTSP, same as the AGV)
+
+The AGV's USB AI camera stream, for the arm's cameras. The process that owns the cameras
+(teleop, record.py or `cameras preview`) runs the same in-process GstRtspServer on port
+8556, and MediaMTX pulls it into the dashboard the same way it pulls the AGV:
+
+```bash
+python -m src.teleop --preset so101 --cameras.wrist.source=0 --cameras.eye.source=2 --stream.enabled=true
+```
+
+| Mount | Camera |
+| --- | --- |
+| `rtsp://<robot pc>:8556/ai` | `--stream.camera` (default: the first camera, `wrist` above) |
+| `rtsp://<robot pc>:8556/<name>` | every other colour camera (`/eye` above) |
+
+In MediaMTX the path source is `rtsp://<arm pc ip>:8556/ai`: the AGV's path, with the
+arm PC's address.
+
+| Arg | Default (`config.stream`) | Meaning |
+| --- | --- | --- |
+| `--stream.enabled=true` | false | start the RTSP server |
+| `--stream.camera` | first camera | camera served at `/<mount>` |
+| `--stream.mount` | `ai` | its path |
+| `--stream.port` `--stream.bind` | `8556` `0.0.0.0` | change the port if the AGV teleop runs on the same PC |
+| `--stream.hw_encode=true` | false | Jetson NVENC (`nvv4l2h264enc`) instead of `x264enc`, as `gst_hw_encode` on the AGV |
+| `--stream.bitrate_kbps` | 1500 | |
+| `--stream.max_repeated_frames` | 30 | last-frame repeats before a mount stops (above) |
+
+Each mount's pipeline (and encoder) only exists while a client pulls it; the feeder sends
+frames at the camera's fps. After a stop, MediaMTX times out and pulls again, and the
+mount streams as soon as the camera delivers frames. Capture, recording and inference
+never wait on the stream. Depth maps are not streamed.
+
+It needs PyGObject and the GStreamer RTSP server in the Python environment that runs
+teleop (Linux / Jetson, as on the AGV). Without them teleop logs `rtsp: GStreamer RTSP
+server unavailable` and runs without the stream; on Windows it is always off. To check it
+without the arm or the dashboard:
+
+```bash
+python -m src.cameras preview --cameras.wrist.source=0 --stream.enabled=true
+ffplay rtsp://<this pc>:8556/ai          # or VLC → Open Network Stream
+```
 
 ---
 
@@ -179,7 +271,7 @@ python -m src.teleop --preset so101 --run_dir ~/.cache/revobots/arm/sessions/202
 | Arg | Default | Meaning |
 | --- | --- | --- |
 | `--robot.type` `--robot.port` `--robot.id` | preset | follower, as in `lerobot-teleoperate` |
-| `--teleop.type` `--teleop.port` `--teleop.id` | preset | leader (`so101_leader`, `koch_leader_remote`, `keyboard_joints`, …) |
+| `--teleop.type` `--teleop.port` `--teleop.id` | preset | leader (`so101_leader`, `koch_leader_remote`, `gamepad_ee`, …) |
 | `--fps` | 30 | control-loop and video fps |
 | `--teleop_time_s` | until Esc | stop after this many seconds |
 | `--display_data=true` | false | stream observations/actions to the visualizer |
@@ -193,8 +285,9 @@ python -m src.teleop --preset so101 --run_dir ~/.cache/revobots/arm/sessions/202
 | `--sessions_root` | `~/.cache/revobots/arm/sessions` | where runs are created |
 | `--record.codec` | `mp4v` | OpenCV FOURCC for the raw session mp4s |
 | `--record.redo_starts_recording=false` | true | after Left/`r`, stay idle instead of recording again |
-| `--cameras.<name>.<field>` | none | camera sources and settings, e.g. `--cameras.wrist.source=0 --cameras.eye.source=2` |
+| `--cameras.<name>.<field>` | none | camera sources and settings, e.g. `--cameras.wrist.source=0 --cameras.eye.source=2`; RealSense depth: `--cameras.eye.type=intelrealsense --cameras.eye.source=<serial> --cameras.eye.use_depth=true` |
 | `--ai.enabled=true` | false | open the UDP link for `inference.py` and enable the `a` key |
+| `--stream.enabled=true` | false | serve the cameras over RTSP for the dashboard (`/ai`, section 2) |
 
 ### Keys
 
@@ -221,22 +314,13 @@ REC session_3 00:12 360f              HUMAN     loop   33.1ms ( 30 Hz)   Space=r
 Left never deletes sessions from an earlier launch, even inside an appended run.
 A session stopped at zero frames is removed.
 
-### Keyboard jog (`--teleop.type=keyboard_joints`)
+### Gamepad instead of a leader arm (`--teleop.type=gamepad_ee`)
 
-Replaces the leader arm with hold-to-move keys, one joint at a time, no IK. The target
-starts at the arm's measured pose, so nothing jumps.
-
-| Joint | decrease / increase | | Joint | decrease / increase |
-| --- | --- | --- | --- | --- |
-| shoulder_pan | `j` / `l` | | wrist_flex | `h` / `y` |
-| shoulder_lift | `k` / `i` | | wrist_roll | `g` / `t` |
-| elbow_flex | `u` / `o` | | gripper | `[` close / `]` open |
-| speed | `-` halve / `+` double | | | |
-
-`--teleop.speed` is in the follower's units per second (degrees for SO-101, default 30),
-`--teleop.gripper_speed` likewise. The teleop keys (Space, Left/`r`, `a`, Esc/`q`) keep
-working, and sessions recorded this way have the same format as leader-recorded ones.
-Keys are global, so do not type in other windows while it runs.
+Replaces the leader arm with a USB or UDP gamepad driving the tool in Cartesian space
+through the URDF IK; the target starts at the arm's measured pose, so nothing jumps. The
+teleop keys (Space, Left/`r`, `a`, Esc/`q`) keep working and sessions recorded this way
+have the same format as leader-recorded ones. Mapping and settings: section 11b,
+[GAMEPAD_REMOTE.md](GAMEPAD_REMOTE.md) and [NERO_IK.md](NERO_IK.md).
 
 ---
 
@@ -253,7 +337,8 @@ operator already defines the episode boundaries with Space.
     │   ├── data.jsonl                     ← one JSON object per frame
     │   ├── meta.json                      ← schema, fps, camera shapes, frame count
     │   ├── video_wrist.mp4                ← frame i of every mp4 == row i of data.jsonl
-    │   └── video_eye.mp4
+    │   ├── video_eye.mp4
+    │   └── eye_depth.u16                  ← only with use_depth: raw uint16 mm frames, same order
     ├── session_1/
     └── session_2/
 ```
@@ -288,10 +373,11 @@ operator already defines the episode boundaries with Space.
   "action_names": ["shoulder_pan.pos", "shoulder_lift.pos", "elbow_flex.pos",
                    "wrist_roll.pos", "wrist_flex.pos", "gripper.pos"],
   "cameras": {
-    "wrist": {"height": 480, "width": 640, "channels": 3, "video": "video_wrist.mp4"},
-    "eye":   {"height": 480, "width": 640, "channels": 3, "video": "video_eye.mp4"}
+    "wrist":     {"height": 480, "width": 640, "channels": 3, "dtype": "uint8",  "video": "video_wrist.mp4"},
+    "eye":       {"height": 480, "width": 640, "channels": 3, "dtype": "uint8",  "video": "video_eye.mp4"},
+    "eye_depth": {"height": 480, "width": 640, "channels": 1, "dtype": "uint16", "unit": "mm", "depth": "eye_depth.u16"}
   },
-  "camera_backends": {"wrist": "gstreamer", "eye": "opencv"},
+  "camera_backends": {"wrist": "gstreamer", "eye": "realsense"},
   "started_at": "2026-09-18T20:05:11",
   "num_frames": 900,
   "duration_s": 29.97,
@@ -343,6 +429,8 @@ python -m src.convert --sessions_dir ~/.cache/revobots/arm/sessions/20260918_200
                       --dataset.repo_id=Aadi/revobots_so101_v1
 python -m src.convert --sessions_dir <run> --dataset.repo_id=Aadi/revobots_so101_v1 --resume            # newer sessions only
 python -m src.convert --sessions_dir <run> --dataset.repo_id=Aadi/revobots_so101_v1 --dataset.push_to_hub=true
+python -m src.convert --sessions_dir <run> --dataset.repo_id=Aadi/revobots_nero_depth_v1 \
+                      --dataset.depth_encoder.depth_max=1.0 --dataset.depth_encoder.use_log=false   # RealSense D405
 ```
 
 | Arg | Default | Meaning |
@@ -355,6 +443,7 @@ python -m src.convert --sessions_dir <run> --dataset.repo_id=Aadi/revobots_so101
 | `--resume` | false | append to an existing dataset; sessions below its episode count are assumed done |
 | `--dataset.push_to_hub=true`, `--dataset.private=true`, `--dataset.tags='["a","b"]'` | preset | upload after writing |
 | `--dataset.video=false` | true | store PNG images instead of video |
+| `--dataset.depth_encoder.depth_min` `.depth_max` `.shift` `.use_log` | `0.01` `10.0` `3.5` `true` (LeRobot's) | how depth is stored (12-bit, metres), as in `lerobot-record`. D405 (7-50 cm): `depth_max=1.0 use_log=false` keeps every millimetre exact. `--resume` keeps the dataset's own settings and stops if the flags disagree |
 | `--dataset.num_image_writer_threads_per_camera` | 4 | |
 | `--dataset.video_encoding_batch_size` | 1 | episodes per encoding batch |
 | `--no_obs_processor` | false | skip the observation processor (keep it on, inference applies the same one) |
@@ -436,6 +525,11 @@ python -m src.inference --robot.type=so101_follower \
 | `--control_time_s` | 60 | seconds to run |
 | `--display_data=true` | false | stream to rerun |
 | `--robot.type` | preset | only the type is used (teleop owns the hardware) |
+| `--ai.max_repeated_frames` | 30 | a camera may repeat its last frame this many times in a row, then inference exits |
+
+If a camera stops delivering, inference reuses its last frame at most 30 times in a row
+and then exits with the camera and frame bus in the error (section 2, "Who reads the
+frames"); teleop's `ai.action_ttl_s` then makes the arm hold its pose.
 
 Hand-over rules, all enforced in teleop:
 
@@ -474,9 +568,9 @@ python -m src.convert --sessions_dir %USERPROFILE%\.cache\revobots\arm\sessions\
 python -m src.replay --robot.type=so101_follower --robot.port=COM4 --robot.id=aadi_so101_follower --session_dir %USERPROFILE%\.cache\revobots\arm\sessions\<run>\session_0
 python -m src.replay --robot.type=so101_follower --robot.port=COM4 --robot.id=aadi_so101_follower --dataset.repo_id=Aadi/revobots_so101_v1 --dataset.episode=0
 
-# keyboard control of the follower, without / with display
-python -m src.teleop --robot.type=so101_follower --robot.port=COM4 --robot.id=aadi_so101_follower --teleop.type=keyboard_joints --teleop.speed=30 --cameras.wrist.source=0 --cameras.eye.source=2
-python -m src.teleop --robot.type=so101_follower --robot.port=COM4 --robot.id=aadi_so101_follower --teleop.type=keyboard_joints --teleop.speed=30 --cameras.wrist.source=0 --cameras.eye.source=2 --display_data=true
+# gamepad control of the follower, without / with display
+python -m src.teleop --robot.type=so101_follower --robot.port=COM4 --robot.id=aadi_so101_follower --teleop.type=gamepad_ee --cameras.wrist.source=0 --cameras.eye.source=2
+python -m src.teleop --robot.type=so101_follower --robot.port=COM4 --robot.id=aadi_so101_follower --teleop.type=gamepad_ee --cameras.wrist.source=0 --cameras.eye.source=2 --display_data=true
 
 # the same with the preset
 python -m src.teleop --preset so101
@@ -484,40 +578,12 @@ python -m src.teleop --preset so101 --display_data=true
 python -m src.record --preset so101 --dataset.num_episodes=10 --dataset.episode_time_s=30 --dataset.reset_time_s=10
 python -m src.replay --preset so101 --session_dir %USERPROFILE%\.cache\revobots\arm\sessions\<run>\session_0
 python -m src.replay --preset so101 --dataset.episode=0
-python -m src.teleop --preset so101_keyboard
+python -m src.teleop --preset so101_gamepad
 ```
 
 ---
 
-## 11b. `test_mediapipe.py` (experimental): gripper from a thumb-index pinch
-
-Webcam → MediaPipe Hands → pinch distance (normalised by hand size) → `gripper.pos`.
-Only the gripper moves; the other joints are held where they are.
-
-```bash
-pip install mediapipe
-python -m src.test_mediapipe --dry_run=true                 # tune first: read the on-screen "pinch" number
-python -m src.test_mediapipe --robot.type=so101_follower --robot.port=COM4 --robot.id=aadi_so101_follower
-```
-
-| Arg | Default | Meaning |
-| --- | --- | --- |
-| `--camera_index` | 0 | webcam for the hand (independent of the robot cameras) |
-| `--dry_run=true` | false | no robot, just the window and the value |
-| `--pinch_closed` / `--pinch_open` | 0.25 / 1.0 | pinch ratio at fully closed / fully open; read them off the window with your hand pinched and open |
-| `--invert=true` | false | flip if the gripper moves the wrong way |
-| `--smooth` | 0.5 | EMA factor, lower = smoother and laggier |
-| `--gripper_min` / `--gripper_max` | 0 / 100 | output clamp |
-| `--show=false` | true | no window, print to the terminal instead |
-
-Press `q` in the window or Ctrl-C to stop. Current MediaPipe builds have no legacy
-`solutions.hands`; the script then uses the Tasks API and downloads `hand_landmarker.task`
-(about 7 MB) into `revobots_arm/models/` on first run. Offline, download it yourself and
-pass `--hand_model=<path>`.
-
----
-
-## 11c. SO-101 IK and gamepad Cartesian control
+## 11b. SO-101 IK and gamepad Cartesian control
 
 `src/kinematics.py` is a numpy-only FK / IK solver that reads any serial-arm URDF (no
 placo needed). `src/so101_ik.py` is the SO-101 profile, using the bundled
@@ -615,7 +681,7 @@ Useful `--teleop.*` settings (all in `GamepadEETeleopConfig`, `src/gamepad_teleo
 is per arm. Point `--teleop.urdf_path`, `--teleop.tip_link` and `--teleop.motors`
 (JSON list, chain order) at that arm's URDF. The follower must report joints in
 degrees (Koch: `--robot.use_degrees=true`). Nero now includes its arm/gripper URDF
-and a native seven-joint interface. Use `nero_gamepad` or `nero_vr`; see
+and a native seven-joint interface. Use `nero_gamepad`; see
 [NERO_IK.md](NERO_IK.md) for Cartesian moves and TCP configuration.
 
 ---
@@ -633,8 +699,16 @@ and a native seven-joint interface. Use `nero_gamepad` or `nero_vr`; see
 | `AI link is off. Restart teleop with --ai.enabled=true` | the `a` key was pressed without the AI link; add `--ai.enabled=true` when you intend to run `inference.py` |
 | `open VIDEOIO/FFMPEG: Failed list devices for backend dshow` | harmless OpenCV warning on Windows while probing cameras |
 | `cameras delivered no frame within 10s` | device opened but streams nothing; try `--cameras.eye.pixel_format=YUYV`, another USB port, or `hw_decode=False` |
+| `No module named 'pyrealsense2'` / `open error` on a RealSense | `pip install pyrealsense2` in the lerobot environment; check the serial with `python -m src.cameras find realsense` and use a USB 3 port |
+| `depth needs type=intelrealsense` | `use_depth=true` was set on an `opencv` camera; only RealSense cameras stream depth |
+| `frame bus lab_eye_depth is empty` from inference | the policy was trained with depth but teleop runs without `--cameras.eye.use_depth=true` |
 | teleop status line frozen, `Waiting for actions from the remote leader arm` | `leader_client.py` is not streaming or `--ip` / port mismatch; the loop resumes by itself when packets arrive |
 | `nothing received from teleop within 5s` from inference | teleop is not running, a camera has `publish_frames=False`, or the `--ai.*` ports differ between the two processes |
+| `frame bus lab_<name> delivered no new frame for 30 reads in a row` | that camera stopped delivering (unplugged, USB bandwidth) or teleop stopped; inference exits, the RTSP mount stops. Check with `python -m src.cameras test` |
+| `rtsp: GStreamer RTSP server unavailable` | PyGObject / gst-rtsp-server are not in this Python environment (always the case on Windows); teleop runs without the stream |
+| `rtsp: cannot listen on 0.0.0.0:8556 (port in use?)` | another RTSP server on this PC, e.g. the AGV teleop; use `--stream.port=8557` and point MediaMTX at it |
+| dashboard empty, no `rtsp /ai: first frame pushed` in the log | MediaMTX is not pulling: its source must be `rtsp://<arm pc ip>:8556/ai` and the port reachable from it |
+| `the stream reads the frame bus, but [...] has publish_frames=False` | streamed cameras must publish to the frame bus; drop `--cameras.<name>.publish_frames=false` or pick another `--stream.camera` |
 | `policy was trained with cameras [...] config has [...]` warning | camera names must match the dataset exactly; rename them in `config.py` |
 | `Refusing to write into a non-empty session folder` | a leftover folder in the run; delete it or use a new run |
 | `<session> has a different schema/fps/camera set` in convert | you changed cameras or fps between sessions; convert those runs into separate datasets |

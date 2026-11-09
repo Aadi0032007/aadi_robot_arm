@@ -2,14 +2,17 @@
 
 Stand-alone control, recording, conversion, replay and inference for the Revobots
 robot arm. Default hardware: **AgileX Nero follower** (CAN) driven by a **Koch leader
-on another PC** over UDP, with two cameras, **wrist** and **eye**. Koch-follower and
-SO-101 presets are one flag away.
+on another PC** over UDP, with two cameras, **wrist** and **eye** (USB/OpenCV or Intel
+RealSense, with optional depth). Koch-follower and SO-101 presets are one flag away.
 
-Nero now also has native seven-joint Cartesian IK, gamepad and VR presets.
+Nero also has native seven-joint Cartesian IK and a gamepad preset.
 See [NERO_IK.md](NERO_IK.md) for self-tests, dry runs, moves and TCP configuration.
 Gamepad control supports local USB or UDP for every arm: add `--port=5001` on
 the robot and run `src.gamepad_remote_client` on the gamepad computer.
 See [GAMEPAD_REMOTE.md](GAMEPAD_REMOTE.md).
+
+With `--stream.enabled=true` the cameras are also served over RTSP for the dashboard,
+exactly like the AGV's USB AI camera: `rtsp://<robot pc>:8556/ai`, pulled by MediaMTX.
 
 Everything here **imports** LeRobot from the repository next to this folder and never
 modifies it. When this folder becomes its own repository, point it at a LeRobot
@@ -17,28 +20,34 @@ checkout with `LEROBOT_SRC` or `ArmConfig.lerobot_src` (or `pip install -e` LeRo
 
 ```
 revobots_arm/
-├── README.md
+├── README.md, HOW_TO_USE.md, NERO_IK.md, GAMEPAD_REMOTE.md
+├── urdf/                  ← so101, koch_v1_1, nero URDFs used by the numpy IK
+├── scripts/build_nero_urdf.py  ← expands the official Nero xacro includes into urdf/nero/nero_with_gripper.urdf
+├── tests/                 ← unittest: gamepad UDP transport, Nero IK / native driver (fake SDK), frame bus hold-last + RTSP mounts
+├── review/nero/           ← historical offline review of the Nero model (not used at runtime)
 └── src/
-    ├── config.py          ← ALL settings, plain Python dataclasses + presets (nero | koch | so101 | so101_remote | so101_keyboard)
-    ├── keyboard_teleop.py ← hold-a-key joint jog teleoperator (no leader arm, no IK)
+    ├── config.py          ← ALL settings, plain Python dataclasses + presets (nero | nero_cartesian | nero_gamepad | koch | so101 | so101_remote | so101_gamepad)
+    ├── devices.py         ← CLI parsing (lerobot-style --robot.* / --teleop.* / --cameras.*), config → LeRobot follower / leader objects
+    ├── _bootstrap.py      ← finds the LeRobot source tree, adds it to sys.path
+    ├── cameras.py         ← UsbCameraCapture (OpenCV / Jetson hw decode) + RealSenseCapture (pyrealsense2, depth), frame bus, CamerasManager, RobotWithCameras, RtspServer (dashboard stream)
+    ├── frame_bus.py       ← shared-memory frame fan-out (AGV design), uint8 colour and uint16 depth regions, HoldLastReader
+    ├── ai_link.py         ← UDP JSON listener/sender for the teleop ↔ inference link
+    ├── recorder.py        ← raw session format: video_<cam>.mp4 + <cam>_depth.u16 + data.jsonl + meta.json
+    ├── teleop.py          ← MAIN: teleop + on-demand recording + AI hand-over (Space / Left / a / Esc)
+    ├── record.py          ← timed, lerobot-record-style recording (alternative to teleop.py)
+    ├── convert.py         ← sessions → LeRobotDataset (mirrors data_convert_agv.py)
+    ├── replay.py          ← replay a raw session or a dataset episode on the arm
+    ├── inference.py       ← policy process; talks to a running teleop through the bus + UDP
+    ├── remote_robot.py    ← ArmProxyRobot: LeRobot Robot backed by the frame bus + UDP
+    ├── leader_client.py   ← runs on the leader PC, streams the Koch or SO-101 leader to the robot PC
     ├── gamepad.py         ← USB gamepad → W3C Xbox layout (mapping lifted from the AGV pilot bridge)
+    ├── gamepad_udp.py     ← UDP transport for gamepad state (encode/decode/validate + UDPGamepadReader)
+    ├── gamepad_remote_client.py ← runs on the gamepad PC, streams the pad to teleop over UDP
     ├── gamepad_teleop.py  ← gamepad Cartesian jog (teleop type gamepad_ee), any arm with a URDF
     ├── kinematics.py      ← numpy-only URDF FK / Jacobian / task-priority IK (no placo)
     ├── so101_ik.py        ← SO-101 IK profile + CLI: print pose, Cartesian goto, self-test
-    ├── test_mediapipe.py  ← experimental: gripper from a thumb-index pinch (webcam + MediaPipe)
-    ├── devices.py         ← config → LeRobot follower / leader objects (robot built without cameras)
-    ├── _bootstrap.py      ← finds the LeRobot source tree, adds it to sys.path
-    ├── cameras.py         ← UsbCameraCapture (hw decode + fallback, frame bus), CamerasManager, RobotWithCameras
-    ├── frame_bus.py       ← shared-memory frame fan-out (copied from the AGV repo)
-    ├── ai_link.py         ← UDP JSON listener/sender for the teleop ↔ inference link
-    ├── recorder.py        ← raw session format: video_<cam>.mp4 + data.jsonl + meta.json
-    ├── teleop.py          ← MAIN: teleop + on-demand recording + AI hand-over (Space / Left / a / Esc)
-    ├── leader_client.py   ← runs on the leader PC, streams the Koch or SO-101 leader to the robot PC
-    ├── inference.py       ← policy process; talks to a running teleop through the bus + UDP
-    ├── remote_robot.py    ← ArmProxyRobot: LeRobot Robot backed by the frame bus + UDP
-    ├── record.py          ← timed, lerobot-record-style recording (alternative to teleop.py)
-    ├── convert.py         ← sessions → LeRobotDataset (mirrors data_convert_agv.py)
-    └── replay.py          ← replay a raw session or a dataset episode on the arm
+    ├── nero_ik.py         ← Nero seven-joint IK profile + CLI (self-test, print pose, Cartesian moves)
+    └── nero_robot.py      ← native seven-joint Nero driver (pyAgxArm) for the Cartesian / gamepad presets
 ```
 
 ---
@@ -50,6 +59,7 @@ revobots_arm/
  ─────────                       ────────────────────────────────────────────────────────
  leader_client.py  ──UDP 5001──▶ teleop.py ─────── owns the arm (CAN / serial)
                                     │  │  ├── owns the cameras  ──▶ frame bus  lab_wrist, lab_eye
+                                    │  │  ├── RTSP :8556 /ai    ◀── MediaMTX pull ──▶ dashboard   (--stream.enabled=true)
                                     │  │  ├── writes sessions   ──▶ <sessions_root>/<run>/session_<i>/
                                     │  │  └── publishes joint state ──UDP 5011──▶ ┐
                                     │  ◀───── applies AI actions ◀──UDP 5010───── inference.py
@@ -60,34 +70,54 @@ revobots_arm/
 Teleop is the only process that opens hardware, exactly like the AGV's `LAB/teleop.py`.
 Inference never touches a camera or the arm: images come from the frame bus, joint
 state from a UDP feed, and its actions are only applied while teleop is in AI mode.
+The RTSP server runs inside teleop like the AGV's, and its feeders read the frame bus too.
 
 ---
 
 ## 2. Cameras (`cameras.py`)
 
-Mirrors the AGV `LAB/cameras.py`:
+Mirrors the AGV `LAB/cameras.py`, with two backends selected by `CameraConfig.type`:
 
-- `UsbCameraCapture` is the sole owner of a device. It keeps the newest BGR frame in a
-  1-slot holder for in-process readers and publishes every frame to `lab_<name>` when
-  `publish_frames=True`. Consumers never block capture.
-- `hw_decode=True` opens the Jetson GStreamer pipeline
+- `UsbCameraCapture` (`type="opencv"`) is the sole owner of a V4L2/DirectShow device. It
+  keeps the newest BGR frame in a 1-slot holder for in-process readers and publishes
+  every frame to `lab_<name>` when `publish_frames=True`. Consumers never block capture.
+  `hw_decode=True` opens the Jetson GStreamer pipeline
   (`v4l2src → nvv4l2decoder mjpeg=1 → nvvidconv`, or the YUY2 variant). If that
   pipeline fails to open, capture falls back to plain OpenCV V4L2 by itself. The default
   is `IS_JETSON` (true when `/etc/nv_tegra_release` exists).
+- `RealSenseCapture` (`type="intelrealsense"`) talks to `pyrealsense2` directly by serial
+  number, the same way the AGV `LAB/cameras.py` does, and is the sole owner of the
+  device like `UsbCameraCapture`. Colour and depth come from one frameset; the arrays
+  are what LeRobot's `RealSenseCamera` returns (unaligned z16 depth, uint16
+  millimetres, `(H, W, 1)`; the sensor is set to 1 mm units, so a D405 is correct too).
+  With `use_depth=True` the depth map appears under the LeRobot key `<name>_depth` and is
+  published to `lab_<name>_depth`. The frame bus has a uint16 dtype for this; one
+  `FrameBusReader(name)` reads either kind.
 - `RobotWithCameras` wraps the LeRobot follower, which is built **without** cameras, and
-  merges the frames (BGR→RGB, resized to the configured shape) into `get_observation()`
-  and `observation_features`. The dataset features are therefore identical to what
-  `lerobot-record` produces with cameras inside the robot.
+  merges the frames (BGR→RGB, depth untouched, resized to the configured shape) into
+  `get_observation()` and `observation_features`. The dataset features are therefore
+  identical to what `lerobot-record` produces with cameras inside the robot, depth
+  included (`observation.images.<name>_depth` with `is_depth_map`).
+- `RtspServer` (`stream.enabled=True`) is the AGV's in-process GstRtspServer on port 8556.
+  `stream.camera` (default the first camera) is served at `/<stream.mount>` (`/ai`, the
+  path MediaMTX pulls on the AGV), every other colour camera at `/<name>`. Each mount is
+  `appsrc → x264enc` (or `nvv4l2h264enc` with `hw_encode`) `→ rtph264pay`, built only
+  while a client pulls it, fed from the frame bus `lab_<name>`.
+- Frame bus gaps: the RTSP feeders and `inference.py` read through `HoldLastReader`.
+  When no new frame arrived since the last read, the previous frame is used again, at
+  most 30 times in a row (`stream.max_repeated_frames`, `ai.max_repeated_frames`); a
+  fresh frame resets the count. After that the mount stops, or inference exits, with
+  an error naming the camera and the frame bus.
 
-Two cameras are configured by default:
+Example rig:
 
 ```python
-CameraConfig(name="wrist", source=video(0))   # /dev/video0 on Linux, index 0 elsewhere
-CameraConfig(name="eye",   source=video(2))
+CameraConfig(name="wrist", source=video(0))                # /dev/video0 on Linux, index 0 elsewhere
+realsense("eye", "123456789012", use_depth=True)          # RealSense serial, colour + depth
 ```
 
-`python -m src.cameras find|test|preview` probes devices, measures the delivered fps per
-backend, and shows live windows.
+`python -m src.cameras find [opencv|realsense] | test | preview` lists devices and RealSense
+serials, measures the delivered fps per backend, and shows live windows (depth colour-mapped).
 
 ---
 
@@ -98,8 +128,9 @@ backend, and shows live windows.
     session_0/
         data.jsonl            one JSON object per frame, same order as the video frames
         meta.json             schema + fps + camera shapes (written on close)
-        video_wrist.mp4       one mp4 per camera key, frame i == data.jsonl row i
+        video_wrist.mp4       one mp4 per colour camera key, frame i == data.jsonl row i
         video_eye.mp4
+        eye_depth.u16         one raw uint16 file per depth key (RealSense use_depth), lossless
     session_1/ ...
 ```
 
@@ -120,9 +151,11 @@ leader's 6; `source` says who was driving (`human` or `ai`):
 ```
 
 `meta.json` carries `robot_type`, `fps`, `state_names`, `action_names`, `cameras`
-(`{name: {height, width, channels, video}}`), `num_frames`, the LeRobot feature dict and
+(`{key: {height, width, channels, dtype, video}}` for colour, `{..., channels: 1, dtype:
+"uint16", unit: "mm", depth}` for depth), `num_frames`, the LeRobot feature dict and
 which capture backend each camera used. `convert.py` reads everything from here, so no
-joint names or shapes are hard-coded anywhere.
+joint names or shapes are hard-coded anywhere; a one-channel camera becomes a depth
+feature and `LeRobotDataset` encodes it with LeRobot's depth video encoder.
 
 Units are whatever the follower reports: Nero and SO-101 in degrees, Koch in
 `-100…100` unless `use_degrees=True`; grippers `0…100` from the leader.
@@ -137,11 +170,12 @@ No JSON. Edit the dataclasses, or add a preset:
 | --- | --- |
 | `robot` (dict) | `type` = a registered LeRobot robot, plus that dataclass's fields. Nero: `interface`, `channel` (`None` = auto), `firmware_version`, `speed_percent`, `teleop_action_joints` … Koch/SO-101: `port`, `id`, `use_degrees` … |
 | `teleop` (dict) | `type` = a registered LeRobot teleoperator. Default `koch_leader_remote` (`host`, `port`, `max_action_age_s`). |
-| `cameras` | list of `CameraConfig` (`name`, `source`, `width`, `height`, `fps`, `hw_decode`, `pixel_format`, `publish_frames`, `rotation`). |
+| `cameras` | list of `CameraConfig` (`name`, `source`, `type` opencv/intelrealsense, `width`, `height`, `fps`, `hw_decode`, `pixel_format`, `use_depth`, `use_rgb`, `warmup_s`, `publish_frames`, `rotation`). |
 | `leader_client` | defaults for the leader PC: `robot_ip`, `port`, `com`, `id`, `fps`, `gripper_open_pos`. |
 | `record` | `codec`, `play_sounds`, `display_*`, `redo_starts_recording`, `frame_stale_s`, and the timed-record knobs. |
 | `dataset` / `replay` / `policy` | `repo_id`, `root`, `push_to_hub`, `tags` · `ramp_s` · `path`, `device`, `duration_s`. |
-| `ai` | `action_port` 5010, `state_port` 5011, `action_ttl_s`, `read_leader_while_ai`, `human_takeover_threshold`, `bus_timeout_s`. |
+| `ai` | `action_port` 5010, `state_port` 5011, `action_ttl_s`, `read_leader_while_ai`, `human_takeover_threshold`, `bus_timeout_s`, `max_repeated_frames`. |
+| `stream` | RTSP for the dashboard: `enabled`, `bind`, `port` 8556, `mount` `ai`, `camera`, `hw_encode`, `bitrate_kbps`, `max_repeated_frames`, `close_wait_*`. |
 
 Select a preset with `--preset koch` on any script or `REVOBOTS_ARM_PRESET=koch`.
 
@@ -165,6 +199,7 @@ python -m src.leader_client --ip <robot pc ip>
 python -m src.cameras find                      # which /dev/video* are the wrist and eye?
 python -m src.cameras test --record_time_s=5    # backend + real fps + bus status per camera
 python -m src.teleop --preset nero              # main tool, see keys below
+python -m src.teleop --preset nero --cameras.wrist.source=0 --stream.enabled=true   # + rtsp://<robot pc>:8556/ai
 python -m src.teleop --robot.type=so101_follower --robot.port=COM4 --robot.id=aadi_so101_follower \
                      --teleop.type=so101_leader --teleop.port=COM5 --teleop.id=aadi_so101_leader
 python -m src.convert --sessions_dir <sessions_root>/<run> --dataset.repo_id=<user>/revobots_nero_v1
@@ -216,5 +251,12 @@ AI run recorded with Space is an eval session with the same format.
 - Raw session video is OpenCV `mp4v` (lossy, same as the AGV splitter); the LeRobot
   dataset re-encodes once more. Set `record.codec` if you need something else.
 - The frame bus is BGR (AGV convention). Every LeRobot-facing path converts to RGB.
+  Depth regions are uint16 millimetres and are passed through untouched.
+- RealSense capture needs `pyrealsense2` (it no longer goes through LeRobot's camera
+  class); it has not been exercised on hardware from this folder yet.
+- The RTSP stream needs PyGObject and gst-rtsp-server (Linux / Jetson); without them it
+  logs an error and everything else runs. It has not been run from this folder yet.
+  Unlike the AGV, a pile-up of CLOSE_WAIT sockets is only logged: exiting teleop for a
+  systemd restart would skip `robot.disconnect()` and lose the session being recorded.
 - Global hotkeys (`pynput`) fire whatever window has focus, like `lerobot-record`.
 - The Nero needs `pyAgxArm` on the robot PC; the leader PC needs LeRobot's `dynamixel` extra.

@@ -4,10 +4,15 @@ LeRobot-style observation/action values are degrees; pyAgxArm receives radians.
 Connecting does not send joint/gripper targets. Read-only clients do not enable.
 """
 from dataclasses import dataclass
+import json
+import logging
 import math
 import platform
 import time
+from pathlib import Path
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 from ._bootstrap import ARM_ROOT
 from .kinematics import SerialChain
@@ -43,6 +48,12 @@ class NeroRobotConfig:
     with_gripper: bool = False
     gripper_mode: str = 'width'  # width (m), angle (deg), auto (0..100% of reported mode)
     gripper_force: float = 0.5
+    rest_on_start: bool = False
+    rest_deg: list[float] | None = None  # seven joint degrees; file wins if present
+    rest_pose_file: str | None = None
+    rest_step_deg: float = 4.0
+    rest_settle_deg: float = 1.0
+    rest_timeout_s: float = 45.0
 
 
 class NeroJointRobot:
@@ -65,6 +76,7 @@ class NeroJointRobot:
         self._connected = self._enabled = False
         self._last_feedback_stamp = None
         self._feedback_changed_at = None
+        self._clip_warn_t = 0.0
         chain = SerialChain.from_urdf(NERO_URDF, 'link7', 'base_link')
         self._lower, self._upper = np.degrees(chain.lower), np.degrees(chain.upper)
         self.logs = {}
@@ -116,6 +128,8 @@ class NeroJointRobot:
                     time.sleep(.01)
             if c.enable_on_connect:
                 self.enable()
+            if c.rest_on_start:
+                self.goto_rest()
         except Exception:
             self.disconnect()
             raise
@@ -136,6 +150,67 @@ class NeroJointRobot:
             self._arm.set_joint_limits_enabled(True)
             self._arm.set_auto_set_motion_mode_enabled(True)
             self._arm.set_speed_percent(self.config.speed_percent)
+
+    def _rest_target_deg(self) -> np.ndarray | None:
+        c = self.config
+        values = None
+        path = (c.rest_pose_file or '').strip()
+        if path:
+            p = Path(path).expanduser()
+            if p.is_file():
+                data = json.loads(p.read_text(encoding='utf-8'))
+                values = data.get('joints_deg', data.get('rest_deg'))
+                logger.info('Nero rest pose from %s', p)
+            else:
+                logger.warning('Nero rest pose file missing: %s', p)
+        if values is None and c.rest_deg is not None:
+            values = c.rest_deg
+        if values is None:
+            return None
+        q = np.array([float(v) for v in values], dtype=float)
+        if q.shape != (7,) or not np.all(np.isfinite(q)):
+            raise ValueError('rest pose must be seven finite joint degrees')
+        return np.clip(q, self._lower, self._upper)
+
+    def goto_rest(self) -> None:
+        """Glide every joint to the saved rest pose. Does not flash firmware."""
+        if not self._enabled:
+            raise RuntimeError('Enable Nero before going to rest')
+        target = self._rest_target_deg()
+        if target is None:
+            logger.warning('rest_on_start is set but no rest pose is configured')
+            return
+        c = self.config
+        step = min(float(c.rest_step_deg), float(c.max_relative_target or c.rest_step_deg))
+        step = max(0.2, step)
+        settle = max(0.2, float(c.rest_settle_deg))
+        timeout = max(1.0, float(c.rest_timeout_s))
+        dt = 1.0 / 30.0
+        t0 = time.monotonic()
+        last_log = 0.0
+        logger.info(
+            'Nero rest: %s',
+            {NERO_JOINTS[i]: round(float(target[i]), 3) for i in range(7)},
+        )
+        while time.monotonic() - t0 < timeout:
+            obs = self.get_observation()
+            measured = np.array([obs[f'{n}.pos'] for n in NERO_JOINTS], dtype=float)
+            err = target - measured
+            remaining = float(np.max(np.abs(err)))
+            now = time.monotonic()
+            if now - last_log >= 1.0:
+                logger.info('Nero rest remaining %.2f deg', remaining)
+                last_log = now
+            if remaining <= settle:
+                action = {f'{n}.pos': float(target[i]) for i, n in enumerate(NERO_JOINTS)}
+                self.send_action(action)
+                logger.info('Nero rest reached (err %.2f deg)', remaining)
+                return
+            cmd = measured + np.clip(err, -step, step)
+            action = {f'{n}.pos': float(cmd[i]) for i, n in enumerate(NERO_JOINTS)}
+            self.send_action(action)
+            time.sleep(dt)
+        raise TimeoutError(f'Nero rest pose not reached within {timeout:.0f}s')
 
     def get_observation(self):
         if not self.is_connected:
@@ -180,8 +255,22 @@ class NeroJointRobot:
         obs = self.get_observation()
         # Missing joints hold their measured angle; order is never dictionary order.
         q = np.array([float(action.get(f'{n}.pos', obs[f'{n}.pos'])) for n in NERO_JOINTS])
-        if not np.all(np.isfinite(q)) or np.any(q < self._lower) or np.any(q > self._upper):
-            raise ValueError('Nero targets must be finite and inside the model joint limits')
+        if not np.all(np.isfinite(q)):
+            raise ValueError('Nero targets must be finite')
+        # After a power cycle the measured pose can sit a few degrees past the
+        # URDF box (J4 especially). Clipping keeps teleop alive instead of
+        # exiting; it does not flash firmware.
+        clipped = np.clip(q, self._lower, self._upper)
+        if np.any(clipped != q):
+            now = time.monotonic()
+            if now - self._clip_warn_t >= 5.0:
+                logger.warning(
+                    'Nero target clipped to URDF limits: %s',
+                    {NERO_JOINTS[i]: (float(q[i]), float(clipped[i]))
+                     for i in range(len(NERO_JOINTS)) if clipped[i] != q[i]},
+                )
+                self._clip_warn_t = now
+            q = clipped
         c = self.config
         if c.max_relative_target is not None:
             measured = np.array([obs[f'{n}.pos'] for n in NERO_JOINTS])

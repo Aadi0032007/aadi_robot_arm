@@ -1,15 +1,15 @@
 """All settings for the Revobots arm, as plain Python. No JSON.
 
 Same idea as the AGV repo's ``LAB/config.py``: dataclasses with sensible defaults,
-edited in place. Three presets are defined at the bottom; pick one with
-``--preset nero|koch|so101|so101_remote`` on any script, or ``REVOBOTS_ARM_PRESET``.
+edited in place. Presets are defined at the bottom; pick one with
+``--preset nero|koch|so101|so101_remote|...`` on any script, or ``REVOBOTS_ARM_PRESET``.
 The default is ``DEFAULT_PRESET``.
 
 ``robot`` and ``teleop`` are dicts because they map 1:1 onto LeRobot's own config
 dataclasses (``KochFollowerConfig``, ``AgxNeroFollowerConfig``, ``KochLeaderRemoteConfig``
 ...): ``type`` is the registered name, every other key is a field of that dataclass.
 Cameras are NOT part of the robot dict: they are owned by ``cameras.py`` (frame bus,
-hardware decode) and merged into the observation by ``RobotWithCameras``.
+hardware decode, RealSense depth) and merged into the observation by ``RobotWithCameras``.
 """
 
 from __future__ import annotations
@@ -36,39 +36,99 @@ def serial_port(windows: str, linux: str) -> str:
 # ── cameras ──────────────────────────────────────────────────────────────────
 
 
+CAMERA_TYPES = ("opencv", "intelrealsense")   # same names as LeRobot's camera registry
+
+
+def depth_key(camera_name: str) -> str:
+    """Observation key / frame-bus name of a camera's depth stream (LeRobot convention)."""
+    return f"{camera_name}_depth"
+
+
 @dataclass
 class CameraConfig:
-    """One USB camera. ``name`` becomes ``observation.images.<name>`` and the frame
-    bus region ``lab_<name>``."""
+    """One camera. ``name`` becomes ``observation.images.<name>`` and the frame bus
+    region ``lab_<name>``; with ``use_depth=True`` there is also
+    ``observation.images.<name>_depth`` (uint16 mm, (H, W, 1)) and ``lab_<name>_depth``.
+
+    ``type="opencv"``          ``source`` = index (Windows) or ``/dev/videoN`` (Linux).
+                               ``hw_decode`` / ``pixel_format`` apply.
+    ``type="intelrealsense"``  ``source`` = serial number (or unique device name) as printed by
+                               ``python -m src.cameras find``. Captured with pyrealsense2 directly
+                               (AGV LAB style), arrays identical to LeRobot's ``RealSenseCamera``;
+                               ``use_rgb`` / ``use_depth`` / ``warmup_s`` apply.
+    """
 
     name: str
     source: int | str
+    type: str = "opencv"                # opencv | intelrealsense
     width: int = 640
     height: int = 480
     fps: int = 30
-    # Jetson: v4l2src → nvv4l2decoder/nvvidconv GStreamer pipeline through OpenCV.
+    # opencv on Jetson: v4l2src → nvv4l2decoder/nvvidconv GStreamer pipeline through OpenCV.
     # If that pipeline fails to open, capture falls back to plain OpenCV V4L2.
     hw_decode: bool = IS_JETSON
-    pixel_format: str = "MJPG"          # MJPG | YUYV (used by both paths)
-    # Publish every frame to shared memory (/dev/shm/lab_<name>) so inference and
-    # any other process can read frames while teleop owns the device.
+    pixel_format: str = "MJPG"          # MJPG | YUYV (opencv only)
+    # intelrealsense: colour stream on/off and depth stream on/off (at least one).
+    use_rgb: bool = True
+    use_depth: bool = False
+    warmup_s: int = 1                   # intelrealsense: warm-up before the first frame (>= 1 s, as LeRobot)
+    # Publish every frame to shared memory (/dev/shm/lab_<name>[, lab_<name>_depth]) so
+    # inference and any other process can read frames while teleop owns the device.
     publish_frames: bool = True
     rotation: int = 0                   # 0 | 90 | 180 | 270, applied after capture
     enabled: bool = True
     open_timeout_sec: float = 12.0
 
     @property
+    def is_realsense(self) -> bool:
+        return self.type == "intelrealsense"
+
+    def validate(self) -> None:
+        if self.type not in CAMERA_TYPES:
+            raise ValueError(f"camera {self.name!r}: type must be one of {CAMERA_TYPES}, got {self.type!r}")
+        if self.rotation not in (0, 90, 180, 270):
+            raise ValueError(f"camera {self.name!r}: rotation must be 0, 90, 180 or 270")
+        if self.is_realsense:
+            if not self.use_rgb and not self.use_depth:
+                raise ValueError(f"camera {self.name!r}: enable use_rgb and/or use_depth")
+        elif self.use_depth or not self.use_rgb:
+            raise ValueError(f"camera {self.name!r}: depth needs type=intelrealsense")
+
+    @property
     def frame_shape(self) -> tuple[int, int, int]:
-        """(height, width, 3) of the frames this camera delivers, after rotation."""
+        """(height, width, 3) of the colour frames this camera delivers, after rotation."""
         if self.rotation in (90, 270):
             return (self.width, self.height, 3)
         return (self.height, self.width, 3)
+
+    @property
+    def depth_shape(self) -> tuple[int, int, int]:
+        """(height, width, 1) of the depth maps (same resolution as colour)."""
+        h, w, _ = self.frame_shape
+        return (h, w, 1)
+
+    def observation_shapes(self) -> dict[str, tuple[int, int, int]]:
+        """What this camera adds to ``observation_features``: ``{name: (H,W,3)}`` and,
+        with depth, ``{name_depth: (H,W,1)}`` (LeRobot's ``<cam>_depth`` convention)."""
+        out: dict[str, tuple[int, int, int]] = {}
+        if self.use_rgb:
+            out[self.name] = self.frame_shape
+        if self.use_depth:
+            out[depth_key(self.name)] = self.depth_shape
+        return out
+
+
+def realsense(name: str, serial_number_or_name: str, use_depth: bool = False, **fields: Any) -> CameraConfig:
+    """An Intel RealSense camera. ``serial_number_or_name`` as ``python -m src.cameras find`` prints it.
+    ``use_depth=True`` records ``observation.images.<name>_depth`` too."""
+    return CameraConfig(name=name, source=serial_number_or_name, type="intelrealsense", use_depth=use_depth, **fields)
 
 
 def default_cameras() -> list[CameraConfig]:
     """The two-camera rig. Not used by any preset by default: cameras are OFF unless given
     on the command line (``--cameras.wrist.source=0 --cameras.eye.source=2``) or a preset
-    sets ``cameras=default_cameras()``."""
+    sets ``cameras=default_cameras()``. A RealSense with depth looks like
+    ``realsense("eye", "123456789012", use_depth=True)``."""
     return [
         CameraConfig(name="wrist", source=video(0)),
         CameraConfig(name="eye", source=video(2)),
@@ -125,6 +185,13 @@ class DatasetConfig:
     video: bool = True                  # convert.py: encode videos (False → PNG images)
     num_image_writer_threads_per_camera: int = 4
     video_encoding_batch_size: int = 1
+    # convert.py: how depth maps are stored (LeRobot's 12-bit depth encoder, metres; LeRobot's defaults).
+    # CLI: --dataset.depth_encoder.depth_max=1.0 --dataset.depth_encoder.use_log=false
+    # D405 (7-50 cm): depth_max=1.0 with use_log=False keeps every millimetre exact.
+    depth_min: float = 0.01
+    depth_max: float = 10.0
+    depth_shift: float = 3.5            # log mode only
+    depth_use_log: bool = True
     episode: int = 0                    # replay.py: --dataset.episode
 
 
@@ -158,12 +225,47 @@ class AiConfig:
     state_port: int = 5011              # teleop → inference   {"seq","t","observation":{...},...}
     action_ttl_s: float = 0.5           # older AI actions are ignored (arm holds)
     bus_timeout_s: float = 5.0          # inference waits this long for the first frame/state
+    # Frame bus gaps: inference reuses the last frame at most this many times in a row,
+    # then stops with an error naming the camera and the frame bus. A fresh frame resets it.
+    max_repeated_frames: int = 30
     # While AI drives, keep reading the leader so a human can take over by moving it.
     # With koch_leader_remote this blocks when the leader client is not streaming.
     read_leader_while_ai: bool = True
     # Leader movement (max joint delta from its pose when AI was enabled) that hands
     # control back to the human. Units follow the leader: Koch ±100 range, SO-101 degrees.
     human_takeover_threshold: float = 8.0
+
+
+@dataclass
+class StreamConfig:
+    """RTSP stream for the dashboard: the AGV ``LAB/cameras.py`` GstRtspServer.
+
+    The process that owns the cameras (teleop, record.py, ``cameras test|preview``) serves
+    ``rtsp://<robot pc>:<port>/<mount>``; MediaMTX pulls it and republishes it to the
+    dashboard, exactly as with the AGV's USB AI camera. ``camera`` (default: the first
+    enabled camera) is served at ``/<mount>``, every other enabled colour camera at
+    ``/<camera name>``. Frames are read from the frame bus ``lab_<name>`` (so the camera
+    needs ``publish_frames=True``); an encoder only runs while a client pulls that mount.
+    Needs PyGObject and gst-rtsp-server (Linux / Jetson); without them the server logs an
+    error and the rest keeps running.
+    """
+
+    # OFF by default. CLI: --stream.enabled=true [--stream.camera=eye] [--stream.hw_encode=true]
+    enabled: bool = False
+    bind: str = "0.0.0.0"
+    port: int = 8556                    # same as the AGV; change it if both run on one PC
+    mount: str = "ai"                   # the path MediaMTX pulls, same as the AGV's USB AI camera
+    camera: str | None = None           # camera served at /<mount>; None = first enabled colour camera
+    hw_encode: bool = False             # True = Jetson NVENC (nvv4l2h264enc); False = x264enc (AGV default)
+    bitrate_kbps: int = 1500
+    # Frame bus gaps: the last frame is re-sent at most this many times in a row; then the
+    # mount stops and logs which camera / frame bus stalled. A fresh frame resets the count.
+    max_repeated_frames: int = 30
+    # More CLOSE_WAIT sockets than this on the port (checked every interval) logs an error.
+    # The AGV exits for a systemd restart there; the arm only logs, because exiting
+    # teleop would skip robot.disconnect() and lose the session being recorded.
+    close_wait_interval_s: float = 30.0
+    close_wait_max: int = 50
 
 
 # ── top level ────────────────────────────────────────────────────────────────
@@ -186,6 +288,7 @@ class ArmConfig:
     replay: ReplayConfig = field(default_factory=ReplayConfig)
     policy: PolicyConfig = field(default_factory=PolicyConfig)
     ai: AiConfig = field(default_factory=AiConfig)
+    stream: StreamConfig = field(default_factory=StreamConfig)
     # Path to <lerobot repo>/src when LeRobot is neither installed nor next to this folder.
     lerobot_src: str | None = None
 
@@ -205,11 +308,43 @@ class ArmConfig:
     def camera_names(self) -> list[str]:
         return [c.name for c in self.enabled_cameras]
 
+    @property
+    def camera_observation_keys(self) -> list[str]:
+        """Image keys the cameras put into the observation: ``<name>`` and ``<name>_depth``."""
+        keys: list[str] = []
+        for c in self.enabled_cameras:
+            keys.extend(c.observation_shapes())
+        return keys
+
     def camera(self, name: str) -> CameraConfig:
         for c in self.cameras:
             if c.name == name:
                 return c
         raise KeyError(f"no camera named {name!r}; have {[c.name for c in self.cameras]}")
+
+    def stream_mounts(self) -> dict[str, CameraConfig]:
+        """RTSP mount → camera: ``stream.camera`` (default the first enabled colour camera) at
+        ``/<stream.mount>``, every other enabled colour camera at ``/<name>``.
+        Raises ``ValueError`` for a setup the stream cannot serve."""
+        cams = [c for c in self.enabled_cameras if c.use_rgb]
+        if not cams:
+            raise ValueError("the stream needs a colour camera: add --cameras.<name>.source=..., "
+                             "or drop --stream.enabled=true")
+        name = cams[0].name if self.stream.camera is None else str(self.stream.camera)
+        main = next((c for c in cams if c.name == name), None)
+        if main is None:
+            raise ValueError(f"stream.camera={name!r} is not an enabled colour camera; have {[c.name for c in cams]}")
+        mounts = {str(self.stream.mount).strip("/"): main}
+        for c in cams:
+            if c is main:
+                continue
+            if c.name in mounts:
+                raise ValueError(f"camera {c.name!r} and stream.mount both want /{c.name}; change --stream.mount")
+            mounts[c.name] = c
+        off_bus = [c.name for c in mounts.values() if not c.publish_frames]
+        if off_bus:
+            raise ValueError(f"the stream reads the frame bus, but {off_bus} has publish_frames=False")
+        return mounts
 
 
 # ── presets ──────────────────────────────────────────────────────────────────
@@ -242,25 +377,6 @@ def gamepad_ee_teleop(**fields: Any) -> dict[str, Any]:
     return dict(type="gamepad_ee", **fields)
 
 
-def hand_ee_teleop(**fields: Any) -> dict[str, Any]:
-    """Webcam hand (MediaPipe, thumb + index) Cartesian teleop through URDF IK (see hand_teleop.py).
-    Defaults = SO-101. Any field of HandEETeleopConfig can be passed, e.g. camera_index=1, invert="y"."""
-    return dict(type="hand_ee", **fields)
-
-
-def vr_ee_teleop(**fields: Any) -> dict[str, Any]:
-    """Meta Quest controller (Quest browser page served by teleop, WebXR) Cartesian teleop through
-    URDF IK (see vr_teleop.py). Defaults = SO-101. Any field of VREETeleopConfig can be passed,
-    e.g. port=8443, hand="left", position_scale=0.7, yaw_offset_deg=180."""
-    return dict(type="vr_ee", **fields)
-
-
-def keyboard_joints_teleop(speed: float = 30.0, gripper_speed: float = 60.0) -> dict[str, Any]:
-    """Hold-a-key joint jog, no leader arm and no IK (see keyboard_teleop.py for the bindings).
-    ``speed`` is in the follower's joint units per second: degrees for SO-101/Nero, % for Koch."""
-    return dict(type="keyboard_joints", speed=speed, gripper_speed=gripper_speed)
-
-
 def nero() -> ArmConfig:
     """AgileX Nero follower over CAN, driven by a Koch leader on another PC (default)."""
     return ArmConfig(
@@ -268,9 +384,9 @@ def nero() -> ArmConfig:
         robot=dict(
             type="agx_nero_follower",
             id="revobots_nero",
-            interface=None,                 # None → auto: agx_cando/0 (Windows), socketcan/can0 (Linux)
-            channel=None,
-            firmware_version="v111",        # "default" (<=1.10) | "v111" (>=1.11)
+            interface="socketcan",
+            channel="can1",                 # USB-CAN (gs_usb); Jetson onboard MTTCAN is can0
+            firmware_version="v121",        # this Nero reports 1.22; do not flash, profile only
             bitrate=1_000_000,
             speed_percent=20,
             max_relative_target=None,       # degrees per step, None = unlimited
@@ -289,8 +405,8 @@ def nero_cartesian() -> ArmConfig:
     from .nero_robot import NERO_JOINTS, NERO_URDF
     cfg = nero()
     cfg.name = 'nero_cartesian'
-    cfg.robot = dict(type='agx_nero_native', id='revobots_nero', interface=None, channel=None,
-        firmware_version='v111', speed_percent=20, max_relative_target=5.,
+    cfg.robot = dict(type='agx_nero_native', id='revobots_nero', interface='socketcan', channel='can1',
+        firmware_version='v121', speed_percent=20, max_relative_target=5.,
         disable_on_disconnect=False, with_gripper=False)
     cfg.teleop = dict(type='gamepad_ee', urdf_path=str(NERO_URDF), tip_link='link7',
         base_link='base_link', motors=list(NERO_JOINTS), orientation_mode='frame',
@@ -306,12 +422,26 @@ def nero_cartesian() -> ArmConfig:
 def nero_gamepad() -> ArmConfig:
     cfg = nero_cartesian()
     cfg.name = 'nero_gamepad'
-    # Same button behavior as SO101: sticks are live, RB opens, LB closes.
+    # Nero controls: sticks are live, LB opens, RB closes; X/Y/B select poses.
     # Auto gripper mode exposes 0..100% in whichever SDK mode is reported.
-    cfg.robot.update(with_gripper=True, gripper_mode='auto')
-    cfg.teleop.update(require_deadman=False, gripper_needs_deadman=False,
+    cfg.robot.update(
+        with_gripper=True, gripper_mode='auto',
+        rest_on_start=True,
+        rest_deg=[0.742, -93.381, -0.228, 100.216, -2.091, 3.129, 78.982],
+        rest_pose_file='/home/revolabs/revobots/porter/arm_rest_pose.json',
+    )
+    cfg.teleop.update(initial_speed_level=5, require_deadman=False, gripper_needs_deadman=False,
         gripper_key='gripper.pos', gripper_min=0., gripper_max=100., gripper_speed=60.,
-        max_tracking_error_deg=5., invert='x,y,z,roll')
+        max_tracking_error_deg=5., invert='x,y,roll', invert_gripper=True,
+        pick_on_x=True, pick_pose_file='/home/revolabs/revobots/porter/arm_pick_pose.json',
+        pick_deg=[0.163, -49.290, 2.444, 78.796, 0.509, 5.388, 56.427],
+        pick_speed_deg_s=90., pick_min_time_s=2.,
+        place_on_y=True, place_pose_file='/home/revolabs/revobots/porter/arm_place_pose.json',
+        place_deg=[-2.396, -90.607, 1.549, 112.206, -4.412, -3.649, 64.670],
+        place_speed_deg_s=90., place_min_time_s=2.,
+        look_on_b=True, look_pose_file='/home/revolabs/revobots/porter/arm_look_pose.json',
+        look_deg=[1.388, -48.965, 2.914, 78.624, 1.302, 2.826, -25.573],
+        look_speed_deg_s=90., look_min_time_s=2.)
     return cfg
 
 
@@ -374,48 +504,12 @@ def so101_remote() -> ArmConfig:
     )
 
 
-def so101_keyboard() -> ArmConfig:
-    """SO-101 follower jogged from the keyboard (no leader arm, no IK)."""
-    return ArmConfig(
-        name="so101_keyboard",
-        robot=so101_follower_robot(),
-        teleop=keyboard_joints_teleop(speed=30.0, gripper_speed=60.0),
-        dataset=DatasetConfig(repo_id="Aadi/revobots_so101_v1", tags=["revobots", "so101", "arm"]),
-        policy=PolicyConfig(path="outputs/train/act_so101/checkpoints/last/pretrained_model"),
-    )
-
-
 def so101_gamepad() -> ArmConfig:
     """SO-101 follower driven in Cartesian space from a USB gamepad (URDF IK, no leader arm)."""
     return ArmConfig(
         name="so101_gamepad",
         robot=so101_follower_robot(),
-        teleop=gamepad_ee_teleop(),
-        dataset=DatasetConfig(repo_id="Aadi/revobots_so101_v1", tags=["revobots", "so101", "arm"]),
-        policy=PolicyConfig(path="outputs/train/act_so101/checkpoints/last/pretrained_model"),
-    )
-
-
-def so101_hand() -> ArmConfig:
-    """SO-101 follower driven by your hand in front of a webcam (MediaPipe thumb + index, URDF IK).
-    Starts by homing every arm joint to 0 deg, then takes your hand pose as the zero reference."""
-    return ArmConfig(
-        name="so101_hand",
-        robot=so101_follower_robot(),
-        teleop=hand_ee_teleop(camera_index=0),
-        dataset=DatasetConfig(repo_id="Aadi/revobots_so101_v1", tags=["revobots", "so101", "arm"]),
-        policy=PolicyConfig(path="outputs/train/act_so101/checkpoints/last/pretrained_model"),
-    )
-
-
-def so101_vr() -> ArmConfig:
-    """SO-101 follower driven by a Meta Quest controller (Quest browser, WebXR, URDF IK).
-    Nothing moves until GRIP is held; every squeeze is a new reference at the arm's current pose.
-    TRIGGER closes the gripper. The headset does not have to be worn once the page is started."""
-    return ArmConfig(
-        name="so101_vr",
-        robot=so101_follower_robot(),
-        teleop=vr_ee_teleop(),
+        teleop=gamepad_ee_teleop(initial_speed_level=5),
         dataset=DatasetConfig(repo_id="Aadi/revobots_so101_v1", tags=["revobots", "so101", "arm"]),
         policy=PolicyConfig(path="outputs/train/act_so101/checkpoints/last/pretrained_model"),
     )
@@ -425,14 +519,10 @@ PRESETS = {
     "nero": nero,
     "nero_cartesian": nero_cartesian,
     "nero_gamepad": nero_gamepad,
-    "nero_vr": nero_vr,
     "koch": koch,
     "so101": so101,
     "so101_remote": so101_remote,
-    "so101_keyboard": so101_keyboard,
     "so101_gamepad": so101_gamepad,
-    "so101_hand": so101_hand,
-    "so101_vr": so101_vr,
 }
 DEFAULT_PRESET = "nero"
 PRESET_ENV_VAR = "REVOBOTS_ARM_PRESET"

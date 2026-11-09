@@ -1,0 +1,99 @@
+test_fresh_frame_resets_the_count (test_frame_bus_hold.HoldLastReaderTests.test_fresh_frame_resets_the_count) ... ok
+test_last_frame_is_reused_while_no_new_one_arrives (test_frame_bus_hold.HoldLastReaderTests.test_last_frame_is_reused_while_no_new_one_arrives) ... ok
+test_nothing_before_the_first_frame_does_not_count (test_frame_bus_hold.HoldLastReaderTests.test_nothing_before_the_first_frame_does_not_count) ... ok
+test_recovers_when_a_fresh_frame_arrives_after_a_stall (test_frame_bus_hold.HoldLastReaderTests.test_recovers_when_a_fresh_frame_arrives_after_a_stall) ... ok
+test_stalls_after_max_repeats_naming_camera_and_bus (test_frame_bus_hold.HoldLastReaderTests.test_stalls_after_max_repeats_naming_camera_and_bus) ... ok
+test_writer_going_away_counts_as_missing_frames (test_frame_bus_hold.HoldLastReaderTests.test_writer_going_away_counts_as_missing_frames) ... ok
+test_cli (test_frame_bus_hold.StreamMountTests.test_cli) ... ok
+test_first_camera_on_ai_others_by_name (test_frame_bus_hold.StreamMountTests.test_first_camera_on_ai_others_by_name) ... ok
+test_setups_that_cannot_stream_raise (test_frame_bus_hold.StreamMountTests.test_setups_that_cannot_stream_raise) ... ok
+test_stream_camera_selects_the_ai_mount (test_frame_bus_hold.StreamMountTests.test_stream_camera_selects_the_ai_mount) ... ok
+test_bad_packets_do_not_refresh_watchdog (test_gamepad_udp.UDPGamepadTests.test_bad_packets_do_not_refresh_watchdog) ... ok
+test_client_default_protocol_is_v2 (test_gamepad_udp.UDPGamepadTests.test_client_default_protocol_is_v2) ... ok
+test_client_reuses_reader_sends_state_and_disconnect (test_gamepad_udp.UDPGamepadTests.test_client_reuses_reader_sends_state_and_disconnect) ... INFO Gamepad -> 127.0.0.1:5001 v1 at 60 Hz (Ctrl-C to stop)
+INFO Gamepad connected: fake pad
+ok
+test_debug_boolean_on_robot_and_client_cli (test_gamepad_udp.UDPGamepadTests.test_debug_boolean_on_robot_and_client_cli) ... ok
+test_debug_shows_exact_sent_and_received_payloads_and_timeout (test_gamepad_udp.UDPGamepadTests.test_debug_shows_exact_sent_and_received_payloads_and_timeout) ... ok
+test_newest_frame_used_without_playing_queue (test_gamepad_udp.UDPGamepadTests.test_newest_frame_used_without_playing_queue) ... ok
+test_normalized_sticks_buttons_and_triggers (test_gamepad_udp.UDPGamepadTests.test_normalized_sticks_buttons_and_triggers) ... ok
+test_only_active_sender_then_takeover_after_timeout (test_gamepad_udp.UDPGamepadTests.test_only_active_sender_then_takeover_after_timeout) ... ok
+test_packet_debug_is_off_by_default (test_gamepad_udp.UDPGamepadTests.test_packet_debug_is_off_by_default) ... ok
+test_port_alias_any_gamepad_robot_and_argument_order (test_gamepad_udp.UDPGamepadTests.test_port_alias_any_gamepad_robot_and_argument_order) ... ok
+test_v2_named_packet_roundtrip_and_brake_hold (test_gamepad_udp.UDPGamepadTests.test_v2_named_packet_roundtrip_and_brake_hold) ... ok
+test_watchdog_disconnect_and_reordered_packets (test_gamepad_udp.UDPGamepadTests.test_watchdog_disconnect_and_reordered_packets) ... ok
+test_chain_and_motor_round_trip (test_nero_ik.NeroIKTests.test_chain_and_motor_round_trip) ... ok
+test_continuous_path_and_infeasible_target (test_nero_ik.NeroIKTests.test_continuous_path_and_infeasible_target) ... ok
+test_gripper_width_is_not_degrees (test_nero_ik.NeroIKTests.test_gripper_width_is_not_degrees) ... ok
+test_invalid_parameters_and_start_limits (test_nero_ik.NeroIKTests.test_invalid_parameters_and_start_limits) ... ok
+test_native_order_no_leader_offsets_and_limit_clipping (test_nero_ik.NeroIKTests.test_native_order_no_leader_offsets_and_limit_clipping) ... WARNING Nero target clipped to URDF limits: {'joint1': (200.0, 154.99998048556108)}
+ok
+test_orientation_failure_rejected (test_nero_ik.NeroIKTests.test_orientation_failure_rejected) ... ok
+test_presets_preserve_leader_and_construct_native (test_nero_ik.NeroIKTests.test_presets_preserve_leader_and_construct_native) ... ok
+test_read_only_sdk_connection_never_enables_or_moves (test_nero_ik.NeroIKTests.test_read_only_sdk_connection_never_enables_or_moves) ... ok
+test_stale_feedback_rejected (test_nero_ik.NeroIKTests.test_stale_feedback_rejected) ... ok
+test_tcp_fixed_transform_and_no_fingers_in_arm_chain (test_nero_ik.NeroIKTests.test_tcp_fixed_transform_and_no_fingers_in_arm_chain) ... ok
+test_tracking_fault_identifies_joint_and_sends_nothing (test_nero_ik.NeroIKTests.test_tracking_fault_identifies_joint_and_sends_nothing) ... ok
+test_b_glides_to_look_pose (test_nero_ik.TeleopIntegrationTests.test_b_glides_to_look_pose) ... INFO Tool pose at start: x= -37.60 cm  y=  -2.31 cm  z= +47.69 cm   roll=  -88.2  pitch=   -9.8  yaw= +169.8 deg
+WARNING look pose file missing: \home\revolabs\revobots\porter\arm_look_pose.json
+INFO going to look pose over ~2.0 s (max joint 69.0 deg). Keep clear.
+ok
+test_dpad_pitch_moves_both_robots_in_opposite_directions_without_changing_speed (test_nero_ik.TeleopIntegrationTests.test_dpad_pitch_moves_both_robots_in_opposite_directions_without_changing_speed) ... INFO Tool pose at start: x= +42.52 cm  y=  -0.00 cm  z= +23.35 cm   roll=  +90.0  pitch=  +87.2  yaw=  +90.0 deg
+INFO Tool pose at start: x= +42.52 cm  y=  -0.00 cm  z= +23.35 cm   roll=  +90.0  pitch=  +87.2  yaw=  +90.0 deg
+INFO Tool pose at start: x= -37.60 cm  y=  -2.31 cm  z= +47.69 cm   roll=  -88.2  pitch=   -9.8  yaw= +169.8 deg
+INFO Tool pose at start: x= -37.60 cm  y=  -2.31 cm  z= +47.69 cm   roll=  -88.2  pitch=   -9.8  yaw= +169.8 deg
+ok
+test_driver_rejection_between_reads_reanchors_and_latches_pause (test_nero_ik.TeleopIntegrationTests.test_driver_rejection_between_reads_reanchors_and_latches_pause) ... INFO Tool pose at start: x=  -0.00 cm  y=  -2.35 cm  z= +71.80 cm   roll=   +0.0  pitch=  -90.0  yaw=  +90.0 deg
+INFO Gamepad re-armed from measured joints; controls are neutral.
+ok
+test_gamepad_frame_jog (test_nero_ik.TeleopIntegrationTests.test_gamepad_frame_jog) ... ok
+test_nero_sticks_and_bumpers_send_seven_joints_and_gripper_without_deadman (test_nero_ik.TeleopIntegrationTests.test_nero_sticks_and_bumpers_send_seven_joints_and_gripper_without_deadman) ... INFO Tool pose at start: x= -37.60 cm  y=  -2.31 cm  z= +47.69 cm   roll=  -88.2  pitch=   -9.8  yaw= +169.8 deg
+INFO Tool pose at start: x= -37.60 cm  y=  -2.31 cm  z= +47.69 cm   roll=  -88.2  pitch=   -9.8  yaw= +169.8 deg
+ok
+test_no_udp_input_does_not_enable_commands_and_reanchors_drift (test_nero_ik.TeleopIntegrationTests.test_no_udp_input_does_not_enable_commands_and_reanchors_drift) ... INFO Tool pose at start: x=  -0.00 cm  y=  -2.35 cm  z= +71.80 cm   roll=   +0.0  pitch=  -90.0  yaw=  +90.0 deg
+WARNING No gamepad attached; no commands sent.
+ok
+test_old_pitch_and_gripper_buttons_do_not_move_robot (test_nero_ik.TeleopIntegrationTests.test_old_pitch_and_gripper_buttons_do_not_move_robot) ... INFO Tool pose at start: x= -37.60 cm  y=  -2.31 cm  z= +47.69 cm   roll=  -88.2  pitch=   -9.8  yaw= +169.8 deg
+ok
+test_optional_deadman_uses_lt_without_opening_gripper (test_nero_ik.TeleopIntegrationTests.test_optional_deadman_uses_lt_without_opening_gripper) ... INFO Tool pose at start: x= -37.60 cm  y=  -2.31 cm  z= +47.69 cm   roll=  -88.2  pitch=   -9.8  yaw= +169.8 deg
+INFO motion ENABLED (LT held)
+ok
+test_pose_glide_holds_on_tracking_reject_instead_of_pausing (test_nero_ik.TeleopIntegrationTests.test_pose_glide_holds_on_tracking_reject_instead_of_pausing) ... INFO Tool pose at start: x= -37.60 cm  y=  -2.31 cm  z= +47.69 cm   roll=  -88.2  pitch=   -9.8  yaw= +169.8 deg
+INFO going to look pose over ~2.3 s (max joint 69.0 deg). Keep clear.
+WARNING look glide holding for the arm to catch up
+ok
+test_pose_glide_stays_within_tracking_limit_on_slow_tick (test_nero_ik.TeleopIntegrationTests.test_pose_glide_stays_within_tracking_limit_on_slow_tick) ... INFO Tool pose at start: x= -37.60 cm  y=  -2.31 cm  z= +47.69 cm   roll=  -88.2  pitch=   -9.8  yaw= +169.8 deg
+WARNING look pose file missing: \home\revolabs\revobots\porter\arm_look_pose.json
+INFO going to look pose over ~2.3 s (max joint 69.0 deg). Keep clear.
+ok
+test_so101_deliberate_rotation_is_not_relaxed (test_nero_ik.TeleopIntegrationTests.test_so101_deliberate_rotation_is_not_relaxed) ... ok
+test_so101_easy_translation_preserves_original_orientation_solution (test_nero_ik.TeleopIntegrationTests.test_so101_easy_translation_preserves_original_orientation_solution) ... ok
+test_so101_floor_stays_enabled (test_nero_ik.TeleopIntegrationTests.test_so101_floor_stays_enabled) ... WARNING tool at the z_min_m floor (2.0 cm); not moving lower.
+ok
+test_so101_translation_relaxes_orientation_when_it_blocks_reach (test_nero_ik.TeleopIntegrationTests.test_so101_translation_relaxes_orientation_when_it_blocks_reach) ... ok
+test_tracking_error_pauses_until_neutral_and_then_resumes (test_nero_ik.TeleopIntegrationTests.test_tracking_error_pauses_until_neutral_and_then_resumes) ... INFO Tool pose at start: x= -37.60 cm  y=  -2.31 cm  z= +47.69 cm   roll=  -88.2  pitch=   -9.8  yaw= +169.8 deg
+WARNING Gamepad tracking error exceeds 5.0 deg; release sticks, D-pad and RB/LB to resume.
+INFO Gamepad re-armed from measured joints; controls are neutral.
+ok
+test_udp_and_local_gamepad_produce_same_robot_commands (test_nero_ik.TeleopIntegrationTests.test_udp_and_local_gamepad_produce_same_robot_commands) ... INFO Gamepad: local test pad
+INFO UDP gamepad on 127.0.0.1:49386; waiting for gamepad_remote_client
+INFO Tool pose at start: x= +42.52 cm  y=  -0.00 cm  z= +23.35 cm   roll=  +90.0  pitch=  +87.2  yaw=  +90.0 deg
+INFO Tool pose at start: x= +42.52 cm  y=  -0.00 cm  z= +23.35 cm   roll=  +90.0  pitch=  +87.2  yaw=  +90.0 deg
+INFO frame=base  speed x0.10 (1.0 cm/s, 6 deg/s)  PRECISION
+INFO frame=base  speed x0.10 (1.0 cm/s, 6 deg/s)  PRECISION
+WARNING Waiting for fresh UDP gamepad input; no commands sent.
+INFO Gamepad: local test pad
+INFO UDP gamepad on 127.0.0.1:49388; waiting for gamepad_remote_client
+INFO Tool pose at start: x= -37.60 cm  y=  -2.31 cm  z= +47.69 cm   roll=  -88.2  pitch=   -9.8  yaw= +169.8 deg
+INFO Tool pose at start: x= -37.60 cm  y=  -2.31 cm  z= +47.69 cm   roll=  -88.2  pitch=   -9.8  yaw= +169.8 deg
+WARNING pick pose file missing: \home\revolabs\revobots\porter\arm_pick_pose.json
+INFO going to pick pose over ~2.0 s (max joint 69.3 deg). Keep clear.
+WARNING pick pose file missing: \home\revolabs\revobots\porter\arm_pick_pose.json
+INFO going to pick pose over ~2.0 s (max joint 69.3 deg). Keep clear.
+WARNING Waiting for fresh UDP gamepad input; no commands sent.
+ok
+
+----------------------------------------------------------------------
+Ran 49 tests in 0.279s
+
+OK

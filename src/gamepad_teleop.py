@@ -23,10 +23,11 @@ Mapping (W3C / Xbox layout, see gamepad.py):
     D-pad up/down        Pitch: tilt the gripper up / down (wrist_flex only)
     D-pad L/R            Roll: rotate the gripper (wrist_roll only)
     RB / LB              Gripper open / close
-    X                    Precision mode on/off (x precision_scale)
-    Y                    Toggle base / tool reference frame
+    X                    Precision mode, or go to pick pose when pick_on_x is set
+    Y                    Toggle base / tool frame, or go to place pose when place_on_y is set
+    B                    Go to look pose when look_on_b is set (otherwise ignored)
     LT                   Deadman only if --teleop.require_deadman=true (off by default)
-    A, B, RT, Start      Reserved (ignored); speed is configured with command arguments
+    A, RT, Start         Reserved (ignored); speed is configured with command arguments
 
 Each tick: target = FK(last command) + twist * dt, in the base or the tool frame, then
 IK seeded from the last command. Because the target is re-based on the last command
@@ -41,10 +42,12 @@ flip that axis: ``--teleop.invert=x,pitch``.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -58,6 +61,7 @@ from .gamepad import (
     BTN_DPAD_LEFT,
     BTN_DPAD_RIGHT,
     BTN_DPAD_UP,
+    BTN_B,
     BTN_LB,
     BTN_LT,
     BTN_RB,
@@ -102,6 +106,7 @@ class GamepadEETeleopConfig(_TeleoperatorConfig):
     gripper_min: float = 0.0
     gripper_max: float = 100.0
     gripper_speed: float = 60.0  # units/s while A or B is held
+    invert_gripper: bool = False  # True = LB opens, RB closes
     # ── speeds (at speed level x1.0) ─────────────────────────────────────────
     max_linear_speed: float = 0.10  # m/s
     max_angular_speed: float = 1.0  # rad/s (~57 deg/s)
@@ -145,6 +150,22 @@ class GamepadEETeleopConfig(_TeleoperatorConfig):
     max_joint_step_deg: float = 5.0  # per control tick
     z_min_m: float | None = 0.02  # tool may not be driven below this height (None = off)
     debug: bool = False  # log which inputs are active (twice a second) to spot a stuck axis
+    # ── stored poses (X = pick, Y = place, B = look in arm mode) ─────────────
+    pick_on_x: bool = False
+    pick_pose_file: str | None = None
+    pick_deg: list[float] | None = None
+    pick_speed_deg_s: float = 30.0
+    pick_min_time_s: float = 2.0
+    place_on_y: bool = False
+    place_pose_file: str | None = None
+    place_deg: list[float] | None = None
+    place_speed_deg_s: float = 30.0
+    place_min_time_s: float = 2.0
+    look_on_b: bool = False
+    look_pose_file: str | None = None
+    look_deg: list[float] | None = None
+    look_speed_deg_s: float = 30.0
+    look_min_time_s: float = 2.0
 
 
 class GamepadEETeleop(_Teleoperator):
@@ -192,6 +213,7 @@ class GamepadEETeleop(_Teleoperator):
 
         self._reader = None
         self._q: np.ndarray | None = None
+        self._measured_q: np.ndarray | None = None
         self._gripper: float | None = None
         self.needs_seed = True
         self._speed_idx = int(min(max(config.initial_speed_level, 0), len(config.speed_levels) - 1))
@@ -203,6 +225,10 @@ class GamepadEETeleop(_Teleoperator):
         self._tracking_paused = False
         self._last_t: float | None = None
         self._warned_at: dict[str, float] = {}
+        self._gliding = False
+        self._glide_name = ""
+        self._q_glide: np.ndarray | None = None
+        self._glide_speed_deg_s = 30.0
 
     # ── features ─────────────────────────────────────────────────────────────
 
@@ -237,8 +263,14 @@ class GamepadEETeleop(_Teleoperator):
                 else "  right stick  up/down = Z up/down        left/right = yaw\n"
             )
             + "  D-pad        left/right = roll          up/down = pitch up/down\n"
-            "  RB / LB      gripper open / close\n"
-            "  X            precision mode on/off      Y = base/tool frame"
+            + ("  RB / LB      gripper close / open\n" if c.invert_gripper else "  RB / LB      gripper open / close\n")
+            + (
+                "  X            go to pick pose            "
+                if c.pick_on_x else
+                "  X            precision mode on/off      "
+            )
+            + ("Y = go to place pose" if c.place_on_y else "Y = base/tool frame")
+            + ("\n  B            go to look pose" if c.look_on_b else "")
         )
 
     # ── lifecycle ────────────────────────────────────────────────────────────
@@ -283,6 +315,7 @@ class GamepadEETeleop(_Teleoperator):
 
     def seed_from_observation(self, observation: dict[str, Any]) -> None:
         self._q = self.kin.motor_to_q(observation)
+        self._measured_q = self._q.copy()
         outside = self.kin.out_of_limits(self._q)
         if outside:
             logger.warning(
@@ -298,17 +331,20 @@ class GamepadEETeleop(_Teleoperator):
     @property
     def command_ready(self) -> bool:
         """The enclosing loop must not transmit stale targets during dropout/pause."""
-        return self._input_available and not self._tracking_paused
+        return self._gliding or (self._input_available and not self._tracking_paused)
 
     def update_observation(self, observation: dict[str, Any]) -> None:
         """Called each control tick before input integration, using live feedback."""
         measured = self.kin.motor_to_q(observation)
+        self._measured_q = measured.copy()
         limit = self.config.max_tracking_error_deg
-        if (self._q is not None and self._input_available and limit is not None
+        if (self._q is not None and self._input_available and not self._gliding and limit is not None
                 and np.max(np.abs(np.degrees(self._q-measured))) > limit):
             if not self._tracking_paused:
                 logger.warning('Gamepad tracking error exceeds %.1f deg; release sticks, D-pad and RB/LB to resume.', limit)
             self._tracking_paused = True
+        if self._gliding:
+            return
         if self._q is None or not self._input_available or self._tracking_paused:
             self._q = measured.copy()
             if self.config.gripper_key:
@@ -316,6 +352,15 @@ class GamepadEETeleop(_Teleoperator):
 
     def on_target_rejected(self, observation: dict[str, Any]) -> None:
         """Handle a tracking fault detected by the driver between loop reads."""
+        measured = self.kin.motor_to_q(observation)
+        self._measured_q = measured.copy()
+        if self._gliding:
+            # Stay on the stored-pose path. Command from where the arm actually
+            # is so the next tick is inside max_relative_target.
+            self._q = measured.copy()
+            self._warn("glide-hold",
+                       f"{self._glide_name or 'pose'} glide holding for the arm to catch up")
+            return
         self._tracking_paused = True
         self.update_observation(observation)
 
@@ -336,28 +381,42 @@ class GamepadEETeleop(_Teleoperator):
             self._warn("nopad", message)
             self._set_engaged(False)
             self._prev_pressed = set()
+            if self._gliding:
+                # Keep the stored-pose move going even if the pad drops out.
+                self._step_glide(dt)
+                self._set_engaged(True)
             return self._action()
 
         self._input_available = True
 
         pressed = {i for i in range(NUM_BUTTONS) if state.pressed(i)}
+        edges = pressed - self._prev_pressed
+        self._prev_pressed = pressed
+        if c.pick_on_x and BTN_X in edges:
+            self._start_named_pose("pick", c.pick_pose_file, c.pick_deg, c.pick_speed_deg_s, c.pick_min_time_s)
+        if c.place_on_y and BTN_Y in edges:
+            self._start_named_pose("place", c.place_pose_file, c.place_deg, c.place_speed_deg_s, c.place_min_time_s)
+        if c.look_on_b and BTN_B in edges:
+            self._start_named_pose("look", c.look_pose_file, c.look_deg, c.look_speed_deg_s, c.look_min_time_s)
+        if self._gliding:
+            self._step_glide(dt)
+            self._set_engaged(True)
+            return self._action()
         if self._tracking_paused:
             v, w = self._twist(state, pressed)
             if not np.any(v) and not np.any(w) and not pressed.intersection((BTN_RB, BTN_LB)):
                 self._tracking_paused = False
                 logger.info('Gamepad re-armed from measured joints; controls are neutral.')
-            self._prev_pressed = pressed
             self._set_engaged(False)
             return self._action()
-        edges = pressed - self._prev_pressed
-        self._prev_pressed = pressed
         self._handle_toggles(edges)
 
         deadman = (BTN_LT in pressed) or not c.require_deadman
         self._set_engaged(deadman)
 
         if c.gripper_key and self._gripper is not None and (deadman or not c.gripper_needs_deadman):
-            direction = (1.0 if BTN_RB in pressed else 0.0) - (1.0 if BTN_LB in pressed else 0.0)
+            open_btn, close_btn = (BTN_LB, BTN_RB) if c.invert_gripper else (BTN_RB, BTN_LB)
+            direction = (1.0 if open_btn in pressed else 0.0) - (1.0 if close_btn in pressed else 0.0)
             if direction:
                 self._gripper = float(np.clip(self._gripper + direction * c.gripper_speed * dt, c.gripper_min, c.gripper_max))
 
@@ -387,6 +446,80 @@ class GamepadEETeleop(_Teleoperator):
             out[self.config.gripper_key] = float(self._gripper)
         return out
 
+    def _load_pose_q(self, name: str, path: str | None, fallback: list[float] | None) -> np.ndarray | None:
+        values = None
+        path = (path or "").strip()
+        if path:
+            p = Path(path).expanduser()
+            if p.is_file():
+                data = json.loads(p.read_text(encoding="utf-8"))
+                values = (data.get("joints_deg") or data.get(f"{name}_deg")
+                          or data.get("rest_deg") or data.get("pick_deg")
+                          or data.get("place_deg") or data.get("look_deg"))
+                logger.info("%s pose from %s", name, p)
+            else:
+                logger.warning("%s pose file missing: %s", name, p)
+        if values is None and fallback is not None:
+            values = fallback
+        if values is None:
+            return None
+        deg = np.array([float(v) for v in values], dtype=float)
+        if deg.shape != (len(self.kin.motors),) or not np.all(np.isfinite(deg)):
+            raise ValueError(f"{name} pose must be {len(self.kin.motors)} finite joint degrees")
+        q = self.kin.motor_to_q({k: float(v) for k, v in zip(self.kin.keys, deg)})
+        return np.clip(q, self.kin.chain.lower, self.kin.chain.upper)
+
+    def _start_named_pose(self, name: str, path: str | None, fallback: list[float] | None,
+                          speed_deg_s: float, min_time_s: float) -> None:
+        if self._q is None:
+            logger.warning("%s requested before the arm was seeded", name)
+            return
+        try:
+            q_goal = self._load_pose_q(name, path, fallback)
+        except (OSError, ValueError, json.JSONDecodeError) as e:
+            logger.warning("could not load %s pose: %s", name, e)
+            return
+        if q_goal is None:
+            logger.warning("%s is bound, but no %s pose is configured", name, name)
+            return
+        origin = self._measured_q if self._measured_q is not None else self._q
+        dist_deg = math.degrees(float(np.max(np.abs(q_goal - origin))))
+        if dist_deg < 0.5:
+            self._q = q_goal
+            self._gliding = False
+            logger.info("already at %s pose (err %.2f deg)", name, dist_deg)
+            return
+        self._q_glide = q_goal
+        self._glide_speed_deg_s = max(float(speed_deg_s), 1e-3)
+        duration_s = max(min_time_s, dist_deg / self._glide_speed_deg_s)
+        self._glide_name = name
+        self._gliding = True
+        self._tracking_paused = False
+        logger.info("going to %s pose over ~%.1f s (max joint %.1f deg). Keep clear.", name, duration_s, dist_deg)
+
+    def _glide_max_step_deg(self) -> float:
+        """Stay inside Nero's max_relative_target (5°) even on a slow control tick."""
+        limit = self.config.max_tracking_error_deg
+        if limit is None:
+            return 4.0
+        return max(0.5, min(4.0, float(limit) - 0.5))
+
+    def _step_glide(self, dt: float) -> None:
+        if self._q_glide is None or self._q is None:
+            self._gliding = False
+            return
+        origin = self._measured_q if self._measured_q is not None else self._q
+        err = self._q_glide - origin
+        remaining = math.degrees(float(np.max(np.abs(err))))
+        if remaining < 0.5:
+            self._q = self._q_glide
+            self._gliding = False
+            logger.info("arrived at %s pose", self._glide_name or "stored")
+            return
+        step_deg = min(self._glide_speed_deg_s * max(dt, 0.0), self._glide_max_step_deg())
+        scale = min(1.0, math.radians(step_deg) / max(float(np.max(np.abs(err))), 1e-12))
+        self._q = origin + err * scale
+
     def _set_engaged(self, engaged: bool) -> None:
         if engaged != self._engaged:
             self._engaged = engaged
@@ -395,10 +528,10 @@ class GamepadEETeleop(_Teleoperator):
 
     def _handle_toggles(self, edges: set[int]) -> None:
         changed = False
-        if BTN_X in edges:
+        if BTN_X in edges and not self.config.pick_on_x:
             self._precision = not self._precision
             changed = True
-        if BTN_Y in edges:
+        if BTN_Y in edges and not self.config.place_on_y:
             self._frame = "tool" if self._frame == "base" else "base"
             changed = True
         if changed:

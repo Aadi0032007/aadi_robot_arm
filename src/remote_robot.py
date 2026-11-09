@@ -3,9 +3,18 @@
 Used by ``inference.py``. Teleop owns the arm and the cameras, so the policy
 process cannot open either. Instead:
 
-    observation.images.<cam>   ← frame bus  ``lab_<cam>``  (shared memory, BGR → RGB)
-    observation.state          ← UDP        ``ai.state_port``  published by teleop each tick
-    action                     → UDP        ``ai.action_port`` applied by teleop while AI is on
+    observation.images.<cam>        ← frame bus  ``lab_<cam>``        (shared memory, BGR → RGB)
+    observation.images.<cam>_depth  ← frame bus  ``lab_<cam>_depth``  (uint16 mm, passed through)
+    observation.state               ← UDP        ``ai.state_port``  published by teleop each tick
+    action                          → UDP        ``ai.action_port`` applied by teleop while AI is on
+
+The bus region of every image feature is simply ``lab_<feature key>``, so a policy
+trained with depth attaches to the depth bus by name, nothing else to configure.
+
+A dropped or skipped frame is bridged with the previous one, at most
+``ai.max_repeated_frames`` times in a row (``frame_bus.HoldLastReader``); after that
+``get_observation`` raises ``FrameBusStalled`` naming the camera and the bus, so a
+stalled camera stops the policy instead of feeding it a frozen image.
 
 Because it implements the ``Robot`` interface, LeRobot's own
 ``lerobot_inference_api.run_inference`` drives it unchanged.
@@ -23,7 +32,7 @@ import numpy as np
 
 from .ai_link import UdpJsonListener, UdpJsonSender
 from .config import AiConfig
-from .frame_bus import FrameBusReader
+from .frame_bus import HoldLastReader
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +74,7 @@ class ArmProxyRobot(_Robot):
             if key.startswith(image_prefix) and ft.get("dtype") in ("image", "video")
         }
 
-        self._readers: dict[str, FrameBusReader] = {}
+        self._readers: dict[str, HoldLastReader] = {}
         self._state_rx: UdpJsonListener | None = None
         self._action_tx: UdpJsonSender | None = None
         self._connected = False
@@ -83,7 +92,7 @@ class ArmProxyRobot(_Robot):
         return {n: float for n in self._action_names}
 
     @property
-    def cameras(self) -> dict[str, FrameBusReader]:
+    def cameras(self) -> dict[str, HoldLastReader]:
         return dict(self._readers) if self._readers else dict.fromkeys(self._camera_shapes)  # type: ignore[return-value]
 
     # ── lifecycle ────────────────────────────────────────────────────────────
@@ -110,7 +119,7 @@ class ArmProxyRobot(_Robot):
         self._state_rx.start()
         self._action_tx = UdpJsonSender(ai.host, ai.action_port)
         for cam in self._camera_shapes:
-            self._readers[cam] = FrameBusReader(cam)
+            self._readers[cam] = HoldLastReader(cam, ai.max_repeated_frames)
 
         deadline = time.monotonic() + ai.bus_timeout_s
         pending = set(self._camera_shapes) | {"<state>"}
@@ -119,7 +128,7 @@ class ArmProxyRobot(_Robot):
                 if cam == "<state>":
                     if self._state_rx.latest() is not None:
                         pending.discard(cam)
-                elif self._readers[cam].read_latest()[1] is not None:
+                elif self._readers[cam].read()[1] is not None:
                     pending.discard(cam)
             if pending:
                 time.sleep(0.1)
@@ -163,16 +172,20 @@ class ArmProxyRobot(_Robot):
             logger.warning("teleop state lacks %s; feeding 0.0 (dataset/robot mismatch?)", missing)
             self._warned_missing_state = True
 
-        for cam, (h, w, _) in self._camera_shapes.items():
-            _ts, bgr = self._readers[cam].read_latest()
-            if bgr is None:
-                raise RuntimeError(f"frame bus lab_{cam} is empty. Is teleop still running?")
-            if bgr.shape[0] != h or bgr.shape[1] != w:
+        for cam, (h, w, c) in self._camera_shapes.items():
+            _ts, img = self._readers[cam].read()  # newest, or the last one held (raises FrameBusStalled)
+            if img is None:
+                raise RuntimeError(f"frame bus lab_{cam} is empty. Is teleop still running (with this camera)?")
+            depth = c == 1
+            if img.shape[0] != h or img.shape[1] != w:
                 if cam not in self._warned_resize:
-                    logger.warning("bus %s is %sx%s, policy expects %sx%s; resizing", cam, bgr.shape[1], bgr.shape[0], w, h)
+                    logger.warning("bus %s is %sx%s, policy expects %sx%s; resizing", cam, img.shape[1], img.shape[0], w, h)
                     self._warned_resize.add(cam)
-                bgr = cv2.resize(bgr, (w, h), interpolation=cv2.INTER_AREA)
-            obs[cam] = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                img = cv2.resize(img, (w, h), interpolation=cv2.INTER_NEAREST if depth else cv2.INTER_AREA)
+            if depth:
+                obs[cam] = img if img.ndim == 3 else img[..., np.newaxis]  # uint16 mm, (H, W, 1)
+            else:
+                obs[cam] = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         return obs
 
     def send_action(self, action: dict[str, float]) -> dict[str, float]:

@@ -7,7 +7,7 @@ Arguments follow lerobot-teleoperate / lerobot-record:
     python -m src.teleop --preset so101 --display_data=true          # presets fill in the rest
     python -m src.teleop --preset so101 --resume                      # append to the latest run
     python -m src.teleop --preset so101 --run_dir <run>               # append to a given run
-    python -m src.teleop --preset so101_keyboard --teleop_time_s=120
+    python -m src.teleop --preset so101_gamepad --teleop_time_s=120
 
 Keys (global, via LeRobot's keyboard listener):
 
@@ -19,10 +19,8 @@ Keys (global, via LeRobot's keyboard listener):
     a           hand control to the AI (inference.py must be running) / take it back
     Esc or q    quit; an ongoing session is saved first
 
-With --teleop.type=vr_ee the second VR controller has Space (X) and Left (Y) too.
-
 Every tick performs the same steps as LeRobot's ``record_loop``: observation
-(motors + frames from ``cameras.py``) → observation processor; leader action →
+(motors + colour/depth frames from ``cameras.py``) → observation processor; leader action →
 teleop processor → robot action processor → ``send_action``. While a session is
 open the processed observation and the action actually applied (human or AI) are
 packed with ``build_dataset_frame`` and written by ``recorder.SessionWriter``.
@@ -219,7 +217,7 @@ def teleop_and_record(
         return delta > ai.human_takeover_threshold
 
     def reseed_teleop() -> None:
-        """Keyboard-jog style devices integrate their own target; restart it from the arm's pose."""
+        """Jog-style devices (gamepad) integrate their own target; restart it from the arm's pose."""
         if hasattr(teleop, "needs_seed"):
             teleop.needs_seed = True
 
@@ -278,11 +276,6 @@ def teleop_and_record(
                 raw_action = teleop.get_action()
                 if getattr(teleop, 'command_ready', True):
                     leader_action = teleop_action_processor((raw_action, obs))
-            # buttons on the input device itself (VR controller: X = Space, Y = Left) act like the keys
-            if hasattr(teleop, "pop_events"):
-                for name in teleop.pop_events():
-                    if name in events:
-                        events[name] = True
 
             # arbitration: human first
             source = "human"
@@ -315,11 +308,21 @@ def teleop_and_record(
                     if source != 'human' or not hasattr(teleop, 'on_target_rejected'):
                         raise
                     # The driver rejected this target before sending anything.
-                    # Re-anchor and require neutral controls, rather than retrying
-                    # the rejected target or dropping out of the teleop session.
+                    # Stored-pose glides hold and retry from measured joints.
+                    # Stick jogging re-anchors and requires neutral controls.
+                    gliding = bool(getattr(teleop, '_gliding', False))
                     teleop.on_target_rejected(e.measured_action)
                     action_values = None
-                    logging.warning('%s; gamepad paused. Release motion controls and RB/LB to resume.', e)
+                    if not gliding:
+                        logging.warning('%s; gamepad paused. Release motion controls and RB/LB to resume.', e)
+                except ValueError as e:
+                    if source != 'human' or not hasattr(teleop, 'on_target_rejected'):
+                        raise
+                    gliding = bool(getattr(teleop, '_gliding', False))
+                    teleop.on_target_rejected(obs)
+                    action_values = None
+                    if not gliding:
+                        logging.warning('%s; gamepad paused. Release motion controls and RB/LB to resume.', e)
 
             obs_processed = None
             if session is not None or display_data:
@@ -361,8 +364,6 @@ def teleop_and_record(
             ctrl = {"human": "HUMAN", "ai": "AI", "ai-waiting": "AI(wait)"}[source]
             print(f"{state:<34} {ctrl:<9} loop {loop_s * 1e3:6.1f}ms ({1 / loop_s if loop_s else 0:3.0f} Hz)   {controls_help}")
             move_cursor_up(1)
-            if hasattr(teleop, "show_status"):  # e.g. the VR headset's status panel
-                teleop.show_status(f"{state}  {ctrl}")
     except KeyboardInterrupt:
         pass
     finally:

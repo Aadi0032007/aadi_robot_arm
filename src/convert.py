@@ -7,6 +7,7 @@ Dataset arguments follow lerobot-record's ``--dataset.*``:
     python -m src.convert --sessions_dir <run> --dataset.repo_id=... --dataset.push_to_hub=true --dataset.private=true
     python -m src.convert --sessions_dir <run> --dataset.repo_id=... --dataset.single_task="Pick the cube" --dataset.fps=30
     python -m src.convert --sessions_dir <run> --dataset.repo_id=... --dataset.video=false --dataset.video_encoding_batch_size=4
+    python -m src.convert --sessions_dir <run> --dataset.repo_id=... --dataset.depth_encoder.depth_max=1.0 --dataset.depth_encoder.use_log=false   # D405
 
 One ``session_<i>/`` folder becomes one episode. This mirrors
 ``src/lerobot/robots/revobots_agv_follower/data_convert_agv.py``: the same
@@ -14,6 +15,13 @@ One ``session_<i>/`` folder becomes one episode. This mirrors
 ``save_episode`` calls the live recorder uses, and the same observation-processor
 symmetry with inference. Unlike the AGV version nothing about the robot is
 hard-coded: joint names, camera shapes, fps and robot type come from ``meta.json``.
+
+Depth keys (``<cam>_depth``, one channel, uint16 mm) become
+``observation.images.<cam>_depth`` with ``info.is_depth_map=True``, which makes
+``LeRobotDataset`` store them with its depth encoder, as ``lerobot-record`` does for a
+RealSense with ``use_depth=True``. ``--dataset.depth_encoder.*`` (depth_min, depth_max,
+shift, use_log; metres) sets that encoder like ``lerobot-record`` does; LeRobot's
+defaults (0.01-10 m, log) otherwise. ``--resume`` always keeps the dataset's own settings.
 """
 
 from __future__ import annotations
@@ -43,6 +51,7 @@ def build_features(meta: dict[str, Any], use_videos: bool = True) -> dict:
     for cam, info in meta.get("cameras", {}).items():
         if "height" not in info:
             raise ValueError(f"Camera '{cam}' in {meta.get('session_name')} has no recorded frames/shape.")
+        # channels=1 → depth map (uint16 mm); hw_to_dataset_features flags it is_depth_map.
         hw_obs[cam] = (int(info["height"]), int(info["width"]), int(info.get("channels", 3)))
     hw_action: dict[str, Any] = {name: float for name in meta["action_names"]}
 
@@ -55,6 +64,17 @@ def build_features(meta: dict[str, Any], use_videos: bool = True) -> dict:
 def _schema_signature(meta: dict[str, Any]) -> tuple:
     cams = tuple(sorted((k, v.get("height"), v.get("width")) for k, v in meta.get("cameras", {}).items()))
     return (meta["fps"], tuple(meta["state_names"]), tuple(meta["action_names"]), cams)
+
+
+def _depth_settings(enc: Any) -> dict[str, Any]:
+    """The four depth quantizer settings of a ``DepthEncoderConfig`` or a plain dict, as floats / bool."""
+    values = enc if isinstance(enc, dict) else vars(enc)
+    return {
+        "depth_min": float(values["depth_min"]),
+        "depth_max": float(values["depth_max"]),
+        "shift": float(values["shift"]),
+        "use_log": bool(values["use_log"]),
+    }
 
 
 def add_session_as_episode(session_dir: Path, dataset, task: str | None, robot_observation_processor) -> int:
@@ -102,10 +122,13 @@ def run_convert(
     no_videos: bool = False,
     no_obs_processor: bool = False,
     limit: int | None = None,
+    depth_encoder: dict[str, Any] | None = None,
 ) -> Path:
     ensure_lerobot_importable()
-    from lerobot.datasets import LeRobotDataset, VideoEncodingManager
+    from lerobot.configs import DepthEncoderConfig, encoder_config_from_video_info
+    from lerobot.datasets import LeRobotDataset, LeRobotDatasetMetadata, VideoEncodingManager
     from lerobot.processor import make_default_processors
+    from lerobot.utils.constants import HF_LEROBOT_HOME
 
     sessions = find_sessions(Path(sessions_dir))
     if not sessions:
@@ -130,12 +153,39 @@ def run_convert(
     if no_obs_processor:
         robot_observation_processor = lambda obs: obs  # noqa: E731
 
+    if resume:
+        # LeRobotDataset.resume() needs an explicit root; this is where create() put it.
+        root = Path(root) if root else HF_LEROBOT_HOME / repo_id
+
+    # Depth storage. On resume it must stay what the dataset already uses: info.json
+    # carries one set of settings for every episode of a depth key.
+    depth_encoder_cfg = None
+    has_depth = any((ft.get("info") or {}).get("is_depth_map") for ft in features.values())
+    if has_depth and not no_videos:
+        if resume:
+            meta = LeRobotDatasetMetadata(repo_id, root=root)
+            stored = [k for k in meta.depth_keys if k in meta.video_keys]
+            if stored:
+                depth_encoder_cfg = encoder_config_from_video_info(meta.features[stored[0]].get("info"))
+                if depth_encoder is not None and _depth_settings(depth_encoder_cfg) != _depth_settings(depth_encoder):
+                    raise SystemExit(
+                        f"{repo_id} stores depth with {_depth_settings(depth_encoder_cfg)}, the command asks for "
+                        f"{_depth_settings(depth_encoder)}. New episodes must match: drop the "
+                        "--dataset.depth_encoder.* flags, or convert into a new --dataset.repo_id."
+                    )
+        elif depth_encoder is not None:
+            depth_encoder_cfg = DepthEncoderConfig(**_depth_settings(depth_encoder))
+
     print(f"[*] sessions dir : {sessions_dir}")
     print(f"[*] sessions     : {len(sessions)}")
     print(f"[*] repo id      : {repo_id}")
     print(f"[*] fps          : {fps}")
     print(f"[*] robot type   : {robot_type}")
     print(f"[*] obs processor: {'DISABLED' if no_obs_processor else 'enabled (symmetric with inference)'}")
+    if depth_encoder_cfg is not None:
+        d = _depth_settings(depth_encoder_cfg)
+        print(f"[*] depth storage: {d['depth_min']:g}-{d['depth_max']:g} m, {'log' if d['use_log'] else 'linear'}"
+              + (" (from the dataset)" if resume else ""))
     print("\n[*] dataset features:")
     for k, v in features.items():
         print(f"      {k:35s} dtype={v['dtype']:8s} shape={tuple(v['shape'])} names={v.get('names', '')}")
@@ -146,6 +196,7 @@ def run_convert(
             repo_id,
             root=root,
             batch_encoding_size=video_encoding_batch_size,
+            depth_encoder=depth_encoder_cfg,
             image_writer_threads=image_writer_threads_per_camera * n_cams,
         )
         start_idx = dataset.num_episodes
@@ -160,6 +211,7 @@ def run_convert(
             use_videos=not no_videos,
             image_writer_threads=image_writer_threads_per_camera * n_cams,
             batch_encoding_size=video_encoding_batch_size,
+            depth_encoder=depth_encoder_cfg,
         )
         start_idx = 0
 
@@ -179,13 +231,13 @@ def run_convert(
         print("\n[*] finalizing dataset ...")
         dataset.finalize()
 
-    print(f"[✓] wrote {total_frames} frames across {len(todo)} episode(s)")
-    print(f"[✓] dataset root: {dataset.root}")
+    print(f"[ok] wrote {total_frames} frames across {len(todo)} episode(s)")
+    print(f"[ok] dataset root: {dataset.root}")
 
     if push_to_hub:
         print("[*] pushing to the Hugging Face Hub ...")
         dataset.push_to_hub(tags=tags, private=private)
-        print("[✓] pushed")
+        print("[ok] pushed")
 
     return Path(dataset.root)
 
@@ -206,6 +258,9 @@ def main() -> None:
     if not ds.repo_id:
         raise SystemExit("Pass --dataset.repo_id=<user>/<name> or set dataset.repo_id in src/config.py.")
 
+    depth_flags = ("dataset.depth_min", "dataset.depth_max", "dataset.depth_shift", "dataset.depth_use_log")
+    depth_encoder = dict(depth_min=ds.depth_min, depth_max=ds.depth_max, shift=ds.depth_shift, use_log=ds.depth_use_log)
+
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     run_convert(
         sessions_dir=args.sessions_dir,
@@ -224,6 +279,8 @@ def main() -> None:
         no_videos=not ds.video,
         no_obs_processor=args.no_obs_processor,
         limit=args.limit,
+        # On resume the dataset's own settings apply; flags given there are only checked against them.
+        depth_encoder=depth_encoder if not args.resume or overridden(overrides, *depth_flags) else None,
     )
 
 

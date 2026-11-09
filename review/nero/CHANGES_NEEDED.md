@@ -2,7 +2,7 @@
 
 Historical review of official AgileX model files and the local Revobots Cartesian stack.
 The subsequent implementation is documented in `../../NERO_IK.md`; native driver,
-model wrapper, CLI and gamepad/VR presets are now present. No hardware was connected.
+model wrapper, CLI and gamepad presets are now present. No hardware was connected.
 
 ## Model and tool frames
 
@@ -32,9 +32,8 @@ Use time-based joint velocity/acceleration limits, Cartesian translation/angular
 
 ## Controls and presets
 
-- `config.py`: retain the working leader preset; add Nero Cartesian/gamepad/VR presets with seven-joint model configuration and no Koch leader action mapping.
+- `config.py`: retain the working leader preset; add Nero Cartesian/gamepad presets with seven-joint model configuration and no Koch leader action mapping.
 - `gamepad_teleop.py`: Nero uses `orientation_mode='frame'`. Reuse base/tool twists and full orientation; arm mode intentionally rotates the shoulder for yaw and can use direct wrist joints.
-- `vr_teleop.py`: add full SE(3) clutch mode. Existing behavior tracks only controller pitch/roll and synthesizes arm pan orientation, so supplying a different URDF alone does not provide Nero orientation control.
 - `so101_ik.py`: keep its five-joint wrapper separate; move reusable Cartesian trajectory execution into shared code for `nero_ik.py`.
 - Keyboard Cartesian controls can use the full-pose jog path; direct joint controls need all seven joint keys.
 
